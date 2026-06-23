@@ -1,33 +1,33 @@
 (chap_gemm_async)=
-# Pipelining GEMM with TMA
+# 使用 TMA 流水线化 GEMM
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- The basic GEMM wastes time taking turns (copy a tile, compute, copy the next) when the two could run at once.
-- Step 4 switches to TMA async loads, Step 5 double-buffers SMEM and prefetches (PIPE_DEPTH=2); full load/compute overlap arrives with warp specialization in Step 7, Step 6 makes the kernel persistent with a tile scheduler.
-- The goal is to load the next tile while the Tensor Cores chew through the current one.
+- 基本 GEMM 在两者可以同时运行时浪费时间轮流（复制一个块、计算、复制下一个）。
+- 第 4 步切换到 TMA 异步加载，第 5 步双缓冲 SMEM 并预取（PIPE_DEPTH=2）；完整的加载/计算重叠通过第 7 步的 warp 特化实现，第 6 步用块调度器使内核持久化。
+- 目标是在张量核心处理当前块时加载下一个块。
 :::
 
-The Tensor Cores are the most expensive unit on the chip, and the correct tiled GEMM from the previous chapter leaves them idle for most of the clock. The kernel takes turns: threads copy a tile into shared memory, the Tensor Cores chew through it, threads copy the next tile, and the Tensor Cores wait. Each stage stalls on the one before it, even though loading the next tile and computing on the current one use entirely separate hardware and could run at the same time. Closing that gap does not require a new data path; the tiles, the layouts, and the math are already right. What has to change is *when* the work happens and *by whom* it is scheduled. This chapter keeps the tile data path exactly as it was and attacks the idleness directly.
+张量核心是芯片上最昂贵的单元，前一章的正确分块 GEMM 让它们在大部分时钟周期中空闲。内核轮流：线程将块复制到共享内存，张量核心处理它，线程复制下一个块，张量核心等待。每个阶段在它前面的阶段上停顿，即使加载下一个块和在当前块上计算使用完全独立的硬件，可以同时运行。缩小这个差距不需要新的数据路径；块、布局和数学已经正确。必须改变的是工作*何时*发生以及*由谁*调度。本章保持块数据路径与之前完全相同，直接攻击空闲。
 
-We get there in three incremental steps, and it helps to know the destination before we start. In Step 4 we hand the bulk GMEM <-> SMEM transfers to TMA, so that dedicated copy hardware moves the tiles instead of the threads. In Step 5 we add a two-stage software pipeline, giving the next K tile somewhere to land while the current one is still being multiplied. And in Step 6 we reshape the launch into a persistent kernel driven by a tile scheduler, which amortizes the per-tile setup and lets us pick a tile order that keeps operands hot. Throughout, the SMEM, TMEM, and register layouts stay exactly as we left them in the previous chapter. The only genuinely new idea is the asynchronous handoff between hardware units: letting one engine run ahead of another instead of marching them in lockstep.
+我们通过三个增量步骤达到目标，知道目的地会有所帮助。在第 4 步中，我们将批量 GMEM <-> SMEM 传输交给 TMA，让专用复制硬件移动块而不是线程。在第 5 步中，我们添加两阶段软件流水线，给下一个 K 块一个着陆的地方，同时当前块仍在被乘。在第 6 步中，我们将启动重塑为由块调度器驱动的持久化内核，它摊薄了每块设置，并让我们选择保持操作数热的块顺序。在整个过程中，SMEM、TMEM 和寄存器布局与前一章保持完全相同。唯一真正新的想法是硬件单元之间的异步交接：让一个引擎超前于另一个而不是齐步走。
 
 (chap_tma_async)=
-## Step 4: TMA Async Load
+## 第 4 步：TMA 异步加载
 
-Our first move is to get the copy itself off the critical path. Think about what the CTA was doing in Steps 1-3: every one of its threads computes addresses and issues load instructions for no reason other than to shuttle tiles into SMEM. That is instruction bandwidth spent on plumbing rather than on math. Step 4 replaces the synchronous `Tx.copy` with TMA, where a single thread issues one command and the TMA engine carries out the whole tile transfer on its own. From here on the examples run at the full M=N=K=4096 size rather than the small sizes of Steps 1-3, and their end-to-end timings appear in the *End-to-End Result* table at the end of {ref}`chap_gemm_advanced`.
+我们的第一步是将复制本身从关键路径上移除。想想 CTA 在第 1-3 步中做了什么：它的每个线程计算地址并发出加载指令，唯一的目的只是将块运送到 SMEM 中。这是花在管道而非数学上的指令带宽。第 4 步用 TMA 替换同步 `Tx.copy`，一个线程发出一个命令，TMA 引擎自己执行整个块传输。从这里开始，示例以完整的 M=N=K=4096 大小运行，而不是第 1-3 步的小大小，它们的端到端计时出现在 {ref}`chap_gemm_advanced` 末尾的*端到端结果*表中。
 
-> **What this step changes: Dispatch**
-> - Scope: unchanged, one warpgroup.
-> - Layout: unchanged, same SMEM/TMEM/register tiles.
-> - Dispatch: GMEM → SMEM loads move from sync `Tx.copy` to the TMA engine.
+> **这一步改变的：调度**
+> - 作用域：不变，一个 warpgroup。
+> - 布局：不变，相同的 SMEM/TMEM/寄存器块。
+> - 调度：GMEM → SMEM 加载从同步 `Tx.copy` 移到 TMA 引擎。
 
-### TMA Issue Pattern
+### TMA 发出模式
 
-Step 4's one change is to replace the synchronous tile copy with a TMA load, so it pays to look closely at how that load is issued. The edit to the source is only a few lines, but the execution model behind those lines is different in kind. A synchronous `Tx.copy` is work that the CTA threads do themselves, with their own instructions; a TMA copy is a command that one thread issues, after which the TMA hardware does all the moving. It is worth seeing the two side by side.
+第 4 步的一个改变是用 TMA 加载替换同步块复制，所以值得仔细看看该加载如何发出。对源代码的编辑只有几行，但这些行背后的执行模型在本质上不同。同步 `Tx.copy` 是 CTA 线程自己用它们自己的指令做的工作；TMA 复制是一个线程发出的命令，之后 TMA 硬件执行所有移动。值得将两者并排查看。
 
-**Before (Step 3)**: all 128 threads participate in the copy, then `cta_sync` makes the shared-memory writes visible:
+**之前（第 3 步）**：所有 128 个线程参与复制，然后 `cta_sync` 使共享内存写入可见：
 ```python
 Tx.cta.copy(Asmem[:, :], A[m_st:m_st+BLK_M, i*BLK_K:(i+1)*BLK_K])   # all 128 threads
 Tx.cta.copy(Bsmem[:, :], B[n_st:n_st+BLK_N, i*BLK_K:(i+1)*BLK_K])
@@ -245,35 +245,35 @@ Almost everything in that kernel is carried over from Step 3. Only five configur
 At this point we have the right pieces but the wrong rhythm. Step 4 still finishes each load before starting the matching MMA, so the load and the multiply never actually run at the same time; the two engines we worked so hard to separate still take turns. The next step leaves the TMA load and store path exactly as it is and instead rearranges the schedule, so that loading one K tile can proceed while compute runs on another.
 
 (chap_software_pipeline)=
-## Step 5: Software Pipeline (PIPE_DEPTH=2)
+## 第 5 步：软件流水线（PIPE_DEPTH=2）
 
-Why couldn't Step 4 overlap the load with the compute, when the two engines are clearly independent? The obstacle turns out to be storage. With only one SMEM tile pair, the next load has nowhere to go: it cannot begin until the current MMA has finished reading that pair, since starting early would overwrite data still in use. Step 5 removes that storage conflict by double-buffering shared memory. The single-warpgroup loop still waits for each MMA before launching the next TMA load, but it now has distinct stages to prefetch into and reuse. We are still at the full M=N=K=4096 size.
+为什么第 4 步不能将加载与计算重叠，当两个引擎明显独立时？障碍原来是存储。只有一个 SMEM 块对时，下一个加载无处可去：它不能在当前 MMA 完成读取该对之前开始，因为提前开始会覆盖仍在使用的数据。第 5 步通过双缓冲共享内存消除该存储冲突。单 warpgroup 循环在发出下一个 TMA 加载之前仍然等待每个 MMA，但它现在有Distinct的阶段可以预取和重用。我们仍然在完整的 M=N=K=4096 大小。
 
-> **What this step changes: Layout**
-> - Scope: unchanged, one warpgroup.
-> - Layout: the single SMEM tile pair becomes a `PIPE_DEPTH`-stage ring buffer.
-> - Dispatch: unchanged, TMA load and `tcgen05` MMA; this step adds prefetch and stage reuse, while full load/compute overlap arrives in Step 7.
+> **这一步改变的：布局**
+> - 作用域：不变，一个 warpgroup。
+> - 布局：单个 SMEM 块对变为 `PIPE_DEPTH` 阶段环形缓冲区。
+> - 调度：不变，TMA 加载和 `tcgen05` MMA；这一步添加预取和阶段重用，而完整的加载/计算重叠在第 7 步到达。
 
-### Pipeline Walkthrough
+### 流水线演练
 
-With `PIPE_DEPTH=2`, the kernel allocates two SMEM stages, giving the load path and the MMA path separate slots to work on.
+使用 `PIPE_DEPTH=2`，内核分配两个 SMEM 阶段，为加载路径和 MMA 路径提供独立的工作槽位。
 
-Read the figure below as the pipeline structure that the two-stage buffer is meant to enable, not as an exact execution trace of this single-warpgroup kernel. Step 5 builds the ring buffer and prefetches later stages, but the main loop still waits for the current MMA before it issues the next TMA load. Full load/compute overlap arrives in Step 7, when warp specialization gives TMA and MMA separate roles.
+将下图视为两阶段缓冲区旨在启用的流水线结构，而不是这个单 warpgroup 内核的精确执行跟踪。第 5 步构建环形缓冲区并预取后续阶段，但主循环在发出下一个 TMA 加载之前仍然等待当前 MMA。完整的加载/计算重叠在第 7 步到达，当 warp 特化给 TMA 和 MMA 独立角色时。
 
-![*Pipeline PIPE_DEPTH=2, the target schedule; this single-warpgroup step only prefetches, full overlap arrives with warp specialization in Step 7*](../img/pipe_depth2.png)
+![*流水线 PIPE_DEPTH=2，目标调度；这个单 warpgroup 步骤只预取，完整重叠通过第 7 步的 warp 特化到达*](../img/pipe_depth2.png)
 
-Once it is primed, the loop alternates through the two stages. Two TMA loads fill both stages up front; after that, the loop waits for the current stage, runs MMA on it, waits for that MMA to finish reading the stage, and then launches the load for `k + PIPE_DEPTH` into the stage that just became reusable. This is not yet a concurrent TMA/MMA schedule, but it establishes the ring-buffer structure that Step 7 will split across producer and consumer roles.
+一旦预热，循环在两个阶段之间交替。两个 TMA 加载预先填充两个阶段；之后，循环等待当前阶段，在其上运行 MMA，等待该 MMA 完成读取阶段，然后为 `k + PIPE_DEPTH` 启动加载到刚变为可重用的阶段。这还不是并发 TMA/MMA 调度，但它建立了第 7 步将跨生产者和消费者角色拆分的环形缓冲区结构。
 
-Concretely, the code differs from Step 4 in four places:
+具体来说，代码与第 4 步在四个地方不同：
 
-1. `Asmem` and `Bsmem` gain a leading `PIPE_DEPTH` dimension, so each stage has its own SMEM storage.
-2. `tma_bar` becomes an array with one mbarrier per stage.
-3. Before the main K loop, the kernel prefetches the first two stages.
-4. The K loop uses `stage = k % PIPE_DEPTH`: wait for the current stage, run MMA on it, then reuse that stage for `k + PIPE_DEPTH`.
+1. `Asmem` 和 `Bsmem` 获得前导 `PIPE_DEPTH` 维度，所以每个阶段有自己的 SMEM 存储。
+2. `tma_bar` 变为每阶段一个 mbarrier 的数组。
+3. 在主 K 循环之前，内核预取前两个阶段。
+4. K 循环使用 `stage = k % PIPE_DEPTH`：等待当前阶段，在其上运行 MMA，然后为 `k + PIPE_DEPTH` 重用该阶段。
 
-### Pipeline Mechanics
+### 流水线机制
 
-**1. Prefetch**: before the main loop ever runs, we load the first `PIPE_DEPTH` stages, so that the loop always finds data waiting for it on the very first iteration:
+**1. 预取**：在主循环运行之前，我们加载前 `PIPE_DEPTH` 个阶段，这样循环总是在第一次迭代时找到等待它的数据：
 ```python
 for s in range(min(PIPE_DEPTH, K_TILES)):
     tma_load(s, s * BLK_K)
