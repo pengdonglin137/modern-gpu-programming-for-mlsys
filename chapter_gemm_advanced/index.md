@@ -1,63 +1,63 @@
 (chap_gemm_advanced)=
-# Scaling GEMM with Warp Specialization and Clusters
+# 使用 Warp 特化和集群扩展 GEMM
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- The pipelined GEMM still has one warpgroup doing load, MMA, and writeback in sequence, the bottleneck this chapter removes.
-- Step 7 specializes warps into roles, Step 8 adds a 2-CTA cluster, Step 9 adds multiple consumers.
-- Each step removes a serial bottleneck, ending near state-of-the-art throughput.
+- 流水线化 GEMM 仍然有一个 warpgroup 按顺序执行加载、MMA 和写回，这是本章消除的瓶颈。
+- 第 7 步将 warp 特化为角色，第 8 步添加 2-CTA 集群，第 9 步添加多个消费者。
+- 每一步消除一个串行瓶颈，最终接近最先进的吞吐量。
 :::
 
-The pipelined GEMM from the previous chapter ({ref}`chap_gemm_async`) is fast, but it still asks one warpgroup to do everything: issue the load, run the MMA, then write the result back. Even with a software pipeline, that one team of threads becomes the place where all three engines meet.
+前一章（{ref}`chap_gemm_async`）的流水线化 GEMM 很快，但它仍然要求一个 warpgroup 做所有事情：发出加载、运行 MMA、然后写回结果。即使有软件流水线，那个线程团队也成为三个引擎相遇的地方。
 
-The symptom is easy to see. The TMA unit goes quiet while the Tensor Cores run, the Tensor Cores go quiet while the result drains to memory, and each engine waits on the others through one set of threads. The way past this is to stop making one team do everything.
+症状很容易看到。张量核心运行时 TMA 单元安静，结果排空到内存时张量核心安静，每个引擎通过一组线程等待其他引擎。解决方法是停止让一个团队做所有事情。
 
-We pursue that idea in three steps of widening cooperation. Step 7 ({ref}`chap_warp_specialization`) specializes warps into producer, consumer, and writeback roles. Step 8 ({ref}`chap_cta_cluster`) joins two CTAs into a cluster that shares operands across their shared memory. Step 9 ({ref}`chap_multi_consumer`) adds a second MMA consumer so one staged tile feeds twice the math.
+我们通过三个扩大合作的步骤追求这个想法。第 7 步（{ref}`chap_warp_specialization`）将 warp 特化为生产者、消费者和写回角色。第 8 步（{ref}`chap_cta_cluster`）将两个 CTA 连接成一个集群，跨共享内存共享操作数。第 9 步（{ref}`chap_multi_consumer`）添加第二个 MMA 消费者，使一个暂存块喂饱两倍的数学运算。
 
-It helps to see the three steps as one pattern at different scales. Step 7 keeps the full pipeline inside one CTA: TMA and MMA share one warpgroup, while writeback runs in another. Step 8 widens cooperation across CTAs, producing a 256×256 tile that spans both of them. Step 9 pushes the compute density further still: the cluster output grows to 512×256, each staged B tile is reused by both consumers, and we arrive at the densest variant in the tutorial.
+将这三步视为不同规模的同一种模式会有所帮助。第 7 步将完整流水线保持在一个 CTA 内：TMA 和 MMA 共享一个 warpgroup，而写回在另一个中运行。第 8 步扩大跨 CTA 的合作，产生跨越两者的 256×256 块。第 9 步进一步推高计算密度：集群输出增长到 512×256，每个暂存 B 块被两个消费者重用，我们到达教程中最密集的变体。
 
-One thing stays constant through all of this. The SMEM, TMEM, and register layouts still honor the contracts we built in the previous two chapters; what changes is *who cooperates*, not how data is laid out. Step 8 is the first time the cooperating scope widens past a single CTA, so its operand tiles are split across two CTAs' shared memory and one layout spans both CTAs along the `cbx` cluster axis.
+有一件事在所有这些中保持不变。SMEM、TMEM 和寄存器布局仍然遵守我们在前两章构建的契约；改变的是*谁合作*，而不是数据如何布局。第 8 步是合作范围首次扩大超过单个 CTA，所以其操作数块跨两个 CTA 的共享内存拆分，一个布局沿 `cbx` 集群轴跨两个 CTA。
 
 
 (chap_warp_specialization)=
-## Step 7: Warp Specialization + Pipeline
+## 第 7 步：Warp 特化 + 流水线
 
-The single-warpgroup kernel leaves performance on the table for a simple reason: every thread walks the same path, load, then compute, then write, and so while it is loading, the Tensor Cores have nothing to do, and while it is computing, the TMA engine has nothing to do. The fix is *warp specialization*. Instead of asking one team of threads to do every job in turn, we hand each job to a dedicated warp and let those warps run at the same time, stitched together by a software pipeline. This is the biggest architectural change in the GEMM path, and the rest of the chapter builds on top of it. The benchmarks here use M=N=K=4096.
+单 warpgroup 内核将性能留在桌上的原因很简单：每个线程走相同的路径，加载、然后计算、然后写，所以当它加载时，张量核心无事可做，当它计算时，TMA 引擎无事可做。修复方法是*warp 特化*。我们不是要求一个线程团队轮流做每项工作，而是将每项工作交给一个专用 warp，让这些 warp 同时运行，通过软件流水线连接。这是 GEMM 路径中最大的架构变化，本章其余部分建立在其之上。这里的基准测试使用 M=N=K=4096。
 
-> **What this step changes: Scope**
-> - Scope: one warpgroup walking load → MMA → writeback in order becomes three concurrent roles (TMA producer, MMA consumer, writeback) connected by full/empty barriers.
-> - Layout: unchanged, same SMEM stages and TMEM accumulator as Step 6.
-> - Dispatch: unchanged, TMA loads, `tcgen05` MMA.
+> **这一步改变的：作用域**
+> - 作用域：一个 warpgroup 按顺序走加载→MMA→写回变为三个并发角色（TMA 生产者、MMA 消费者、写回），由 full/empty 屏障连接。
+> - 布局：不变，与第 6 步相同的 SMEM 阶段和 TMEM 累加器。
+> - 调度：不变，TMA 加载、`tcgen05` MMA。
 
-**Topics.**
+**主题。**
 
-- Warp specialization: dedicating different warps/warpgroups to different tasks
+- Warp 特化：将不同的 warp/warpgroup 分配给不同的任务
 
-- High-level barrier abstractions: `TMABar`, `TCGen05Bar`, `MBarrier`
+- 高级屏障抽象：`TMABar`、`TCGen05Bar`、`MBarrier`
 
-- `PipelineState` for automatic stage/phase management
+- `PipelineState` 用于自动阶段/阶段管理
 
-- `warpgroup_sync` barrier IDs for per-warpgroup synchronization
+- `warpgroup_sync` 屏障 ID 用于每 warpgroup 同步
 
-(The multi-stage SMEM pipeline and the persistent `ClusterPersistentScheduler2D` are reused unchanged from Steps 5–6; only the scope split is new here.)
+（多阶段 SMEM 流水线和持久化 `ClusterPersistentScheduler2D` 从第 5-6 步不变地重用；只有作用域拆分是新的。）
 
-### From Sequential to Concurrent
+### 从顺序到并发
 
-Before introducing the roles and barriers, it helps to isolate the scheduling bottleneck that warp specialization removes. The figure below uses a Step-4-style sequential timeline as a compact reference for the pre-specialization kernels in Steps 4-6, then puts it above the Step 7 warp-specialized schedule so the difference in engine utilization is visible at a glance.
+在引入角色和屏障之前，值得隔离 warp 特化消除的调度瓶颈。下图使用第 4 步风格的顺序时间线作为第 4-6 步特化前内核的紧凑参考，然后将其放在第 7 步 warp 特化调度之上，使引擎利用率的差异一目了然。
 
-![Warp Specialization Timeline](../img/warp_specialization_timeline.png)
+![Warp 特化时间线](../img/warp_specialization_timeline.png)
 
-On top is the pre-specialization single-warpgroup pattern: the same unspecialized thread group owns both the load path and the MMA path, so one engine can easily go idle while the other is active. Steps 5 and 6 improve that baseline with double buffering and persistent scheduling, but they do not yet split loading and compute into independent producer and consumer roles. On the bottom, specialization breaks that turn-taking. The TMA producer prefetches the next tile while the MMA consumer is busy computing, and writeback proceeds on its own. Producer warp 3 issues the next load while consumer warp 0 is still working through the current MMA, so neither engine has to wait on the other. The load/MMA handoff uses two barriers:
+上面是特化前的单 warpgroup 模式：相同的未特化线程组拥有加载路径和 MMA 路径，所以一个引擎在另一个活跃时容易空闲。第 5 步和第 6 步通过双缓冲和持久调度改进了该基线，但它们尚未将加载和计算拆分为独立的生产者和消费者角色。在底部，特化打破了这种轮流。TMA 生产者在 MMA 消费者忙于计算时预取下一个块，写回独立进行。生产者 warp 3 在消费者 warp 0 仍在处理当前 MMA 时发出下一个加载，所以两个引擎都不必等待对方。加载/MMA 交接使用两个屏障：
 
-- **`tma2mma`** (TMA → MMA): signals that the loaded SMEM data is ready for MMA to consume.
-- **`mma2tma`** (MMA → TMA): signals that MMA has finished reading a buffer, so TMA can reuse it for the next load.
+- **`tma2mma`**（TMA → MMA）：发出信号表示加载的 SMEM 数据已准备好供 MMA 消费。
+- **`mma2tma`**（MMA → TMA）：发出信号表示 MMA 已完成读取缓冲区，TMA 可以将其重用于下一个加载。
 
-One detail in the figure can look like a mistake at first: the `mma2tma` arrows skip ahead by a stage. The reason is the ring buffer. With `PIPE_DEPTH=2` there are two SMEM buffers, stage 0 and stage 1; TMA Load k=0 fills buffer 0, and TMA Load k=1 fills buffer 1. When MMA Compute k=0 finishes reading buffer 0, it signals `mma2tma` to say the buffer is free, but the load that actually wants buffer 0 back is TMA Load k=2, not k=1 (which is using buffer 1). That is why the `mma2tma` arrow from MMA Compute k=0 reaches all the way to TMA Load k=2. The release jumps a stage simply because the ring has two slots.
+图中的一个细节初看可能像错误：`mma2tma` 箭头跳过了一个阶段。原因是环形缓冲区。使用 `PIPE_DEPTH=2`，有两个 SMEM 缓冲区，阶段 0 和阶段 1；TMA 加载 k=0 填充缓冲区 0，TMA 加载 k=1 填充缓冲区 1。当 MMA 计算 k=0 完成读取缓冲区 0 时，它发出 `mma2tma` 信号表示缓冲区空闲，但实际想要缓冲区 0 回来的是 TMA 加载 k=2，不是 k=1（它使用缓冲区 1）。这就是为什么 MMA 计算 k=0 的 `mma2tma` 箭头一路到达 TMA 加载 k=2。释放跳过一个阶段只是因为环有两个槽。
 
-### Warp Roles
+### Warp 角色
 
-The timeline showed *why* we split the work; the next question is *who* does each part. Specialization assigns the three jobs (load, compute, writeback) to specific warps so they can run at once. With `WG_NUMBER=2`, the kernel uses two warpgroups (abbreviated WG in the role table):
+时间线展示了*为什么*我们拆分工作；下一个问题是*谁*做每部分。特化将三项工作（加载、计算、写回）分配给特定 warp，使它们可以同时运行。使用 `WG_NUMBER=2`，内核使用两个 warpgroup（在角色表中缩写为 WG）：
 
 | Actor | Location | Job |
 |-------|----------|-----|
