@@ -1,27 +1,27 @@
 (chap_tirx_layout_api)=
-# TIRx Layout API
+# TIRx 布局 API
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- The TIRx layout API turns the layout notation from {ref}`chap_data_layout` into compiler objects. The main objects are `TileLayout`, `SwizzleLayout`, and `ComposeLayout`.
-- `TileLayout` describes affine placement over named hardware axes. It is built from shard specs `S[...]`, replica specs `R[...]`, and optional offsets.
-- A layout maps one logical coordinate to one or more physical coordinates. `layout.apply()` evaluates that mapping.
-- `SwizzleLayout` describes the XOR-based shared-memory swizzles used to avoid bank conflicts. `ComposeLayout` stacks a swizzle on top of a tile layout.
-- Ready-made constructors such as `tmem_datapath_layout`, `tcgen05_atom_layout`, and `wg_local_layout` cover the hardware layouts that appear repeatedly in kernels.
+- TIRx 布局 API 将 {ref}`chap_data_layout` 中的布局表示法转化为编译器对象。主要对象是 `TileLayout`、`SwizzleLayout` 和 `ComposeLayout`。
+- `TileLayout` 描述跨命名硬件轴的仿射放置。它由分片规范 `S[...]`、副本规范 `R[...]` 和可选偏移构建。
+- 布局将一个逻辑坐标映射到一个或多个物理坐标。`layout.apply()` 评估该映射。
+- `SwizzleLayout` 描述用于避免 bank 冲突的基于 XOR 的共享内存 swizzle。`ComposeLayout` 将 swizzle 堆叠在块布局之上。
+- 现成的构造函数如 `tmem_datapath_layout`、`tcgen05_atom_layout` 和 `wg_local_layout` 涵盖了内核中反复出现的硬件布局。
 :::
 
-{ref}`chap_data_layout` introduced the notation used throughout this book: a tile shape, a set of strides over named axes, and an optional replication term for values that are copied rather than partitioned. This chapter turns that notation into the API used by the compiler.
+{ref}`chap_data_layout` 介绍了本书中使用的表示法：块形状、跨命名轴的步长集，以及用于复制而非分区的值的可选复制项。本章将该表示法转化为编译器使用的 API。
 
-The goal is that the notation on the page and the code in the kernel look almost the same. When you write a layout such as:
+目标是页面上的表示法和内核中的代码看起来几乎相同。当你编写这样的布局时：
 
 ```python
 S[(128, 256) : (1@TLane, 1@TCol)]
 ```
 
-you are not just writing an explanation. You are constructing a `TileLayout` object that can be attached to a buffer. After that, every tile operation that touches the buffer can read its placement from the layout. The placement is written once, checked once, and reused by the compiler.
+你不仅仅是在编写解释。你正在构造一个可以附加到缓冲区的 `TileLayout` 对象。之后，接触缓冲区的每个块操作都可以从布局中读取其放置。放置写入一次，检查一次，由编译器重用。
 
-A layout is attached either when allocating from a pool or when declaring a buffer:
+布局在从池分配或声明缓冲区时附加：
 
 ```python
 pool.alloc(shape, dtype, layout=layout)
@@ -29,9 +29,9 @@ pool.alloc(shape, dtype, layout=layout)
 T.decl_buffer(shape, dtype, scope=scope, layout=layout)
 ```
 
-From that point on, the buffer carries its physical placement. The tile operations do not need to repeat where each element lives.
+从那时起，缓冲区携带其物理放置。块操作不需要重复每个元素存在于何处。
 
-The layout objects live in one module:
+布局对象在一个模块中：
 
 ```python
 from tvm.tirx.layout import (
@@ -51,13 +51,13 @@ from tvm.tirx.layout import (
 )
 ```
 
-There is one central idea behind the API. A layout does not have to map a logical index to a single physical address. It maps a logical index to a set of physical coordinates over named axes. In the usual case that set has one element. When replication is present, the same logical element has several physical placements.
+API 背后有一个核心思想。布局不必将逻辑索引映射到单个物理地址。它将逻辑索引映射到跨命名轴的一组物理坐标。在通常情况下，该集合有一个元素。当存在复制时，相同的逻辑元素有多个物理放置。
 
-This is why the layout model has three pieces: shard, replica, and offset. The shard places the element. The replica copies it to additional coordinates. The offset shifts the whole placement.
+这就是为什么布局模型有三个部分：分片、副本和偏移。分片放置元素。副本将其复制到额外坐标。偏移移动整个放置。
 
-## Layouts by Example
+## 布局示例
 
-The examples below show the basic shape of the API.
+下面的示例展示了 API 的基本形状。
 
 An accumulator in TMEM can be written as a direct placement over the TMEM axes:
 
