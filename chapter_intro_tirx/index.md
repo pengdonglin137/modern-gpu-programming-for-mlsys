@@ -1,44 +1,41 @@
 (chap_tirx_primer)=
-# Introduction to TIRx
+# TIRx 简介
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- TIRx is a Python DSL for writing GPU kernels at the IR level: you name hardware directly, but through structured IR.
-- Every tile operation is controlled by three design elements: *scope* (which threads), *layout* (where tiles live), and *dispatch* (which hardware path).
-- One runnable single-MMA GEMM shows all three; the rest of the book is these design elements at scale.
+- TIRx 是一个 Python DSL，用于在 IR 层面编写 GPU 内核：你直接命名硬件，但通过结构化 IR。
+- 每个块操作由三个设计元素控制：*作用域*（哪些线程）、*布局*（块存在于何处）和*调度*（哪条硬件路径）。
+- 一个可运行的单 MMA GEMM 展示了所有三个；本书其余部分是这些设计元素的大规模应用。
 :::
 
-:::{admonition} Running the examples
+:::{admonition} 运行示例
 :class: note
 
-These examples need a Blackwell GPU (`sm_100a`, such as a B200). The TIRx compiler ships as the
-`tvm.tirx` module of the Apache TVM wheel; install it alongside a CUDA build of PyTorch:
+这些示例需要 Blackwell GPU（`sm_100a`，如 B200）。TIRx 编译器作为 Apache TVM wheel 的 `tvm.tirx` 模块发布；与 CUDA 版本的 PyTorch 一起安装：
 
 ```bash
 pip install apache-tvm==0.25.0
 ```
 
-Confirm it imports with `python -c "import tvm, tvm.tirx; print(tvm.__version__)"`. The same setup
-runs every runnable example in the book.
+确认它可以通过 `python -c "import tvm, tvm.tirx; print(tvm.__version__)"` 导入。相同的设置运行本书中的每个可运行示例。
 :::
 
-Part I explained what the hardware is. To make it compute anything, we need a way to program it.
+第一部分解释了硬件是什么。要让它计算任何东西，我们需要一种编程方式。
 
-We could write raw CUDA or PTX, and many fast kernels are written exactly that way. The problem is that the decisions that actually determine a kernel's behavior are hard to see there: which threads run an operation, where each tile of data lives, and which hardware path executes it. Those choices are buried in intrinsic arguments, address arithmetic, and convention.
+我们可以编写原始 CUDA 或 PTX，许多快速内核正是那样编写的。问题是真正决定内核行为的决策在那里很难看到：哪些线程运行操作，每个数据块存在于何处，以及哪条硬件路径执行它。这些选择隐藏在内部函数参数、地址计算和约定中。
 
-TIRx (Tensor IR neXt) is a Python DSL that lifts those three decisions into the open: **scope** (which threads run an operation), **layout** (where the operand tiles live), and **dispatch** (which hardware path executes it). It still names hardware concepts directly, including threads, shared and tensor memory, barriers, and `tcgen05` MMA. The difference is that those choices are now structured IR the compiler can lower, check, and schedule.
+TIRx（Tensor IR neXt）是一个 Python DSL，将这三个决策提升到显式位置：**作用域**（哪些线程运行操作）、**布局**（操作数块存在于何处）和**调度**（哪条硬件路径执行它）。它仍然直接命名硬件概念，包括线程、共享内存和张量内存、屏障和 `tcgen05` MMA。区别是这些选择现在是可以被编译器降低、检查和调度的结构化 IR。
 
-Rather than introduce these ideas in the abstract, we will work from a single complete kernel: a minimal single-MMA GEMM. We get it running first, and only then read it back, line by line, to see how scope, layout, and dispatch each shape it and how the kernel is compiled. The tensor layout model that the kernel relies on is developed in its own right in {ref}`chap_tirx_layout_api`, and the full language-feature set in {ref}`chap_language_reference`; here we keep the focus on the one kernel and the three design elements.
+我们不是抽象地介绍这些概念，而是从一个完整的内核开始：一个最小的单 MMA GEMM。我们先让它运行起来，然后逐行回顾它，看看作用域、布局和调度如何各自塑造它以及内核如何编译。内核依赖的张量布局模型在 {ref}`chap_tirx_layout_api` 中独立开发，完整的语言特性集在 {ref}`chap_language_reference` 中；这里我们专注于这一个内核和三个设计元素。
 
-## A First Kernel: Single-MMA GEMM
+## 第一个内核：单 MMA GEMM
 
-The kernel we promised is a minimal GEMM, pared down to the smallest version that still exercises a Tensor Core. It computes a single 128 x 128 output tile of `D = A B^T` with K = 64. The whole computation is expressed as one `Tx.gemm_async` tile operation, from end to end. (That one tile operation does not map to a single hardware instruction: because the hardware MMA K-atom is 16, the K=64 tile lowers to a short sequence of `tcgen05.mma` instructions stepping along K. The point of the DSL is precisely that we write the tile, not the sequence.) Around that operation, the kernel does the usual chores: it allocates shared memory (SMEM) and tensor memory (TMEM), copies A and B from global to shared memory, issues the tile MMA into a TMEM accumulator, reads that accumulator back out through registers, and stores the result. Small as it is, this kernel is Step 1 of the GEMM ladder we climb in {ref}`chap_gemm_basics`, where it returns with a full walkthrough.
+我们承诺的内核是一个最小的 GEMM，精简到仍然使用张量核心的最小版本。它计算 K = 64 时 `D = A B^T` 的单个 128 x 128 输出块。整个计算从头到尾表示为一个 `Tx.gemm_async` 块操作。（那个块操作不映射到单个硬件指令：因为硬件 MMA K-原子是 16，K=64 块降低为沿 K 步进的短序列 `tcgen05.mma` 指令。DSL 的关键正是我们编写块，而不是序列。）围绕该操作，内核执行常规任务：分配共享内存（SMEM）和张量内存（TMEM），将 A 和 B 从全局复制到共享内存，将块 MMA 发送到 TMEM 累加器，通过寄存器将累加器读回，并存储结果。尽管很小，这个内核是 {ref}`chap_gemm_basics` 中我们攀登的 GEMM 阶梯的第 1 步，它在那里带着完整讲解返回。
 
-Every TIRx kernel begins from the same handful of imports, so it is worth seeing them once up front:
+每个 TIRx 内核都从相同的几个导入开始，所以值得先看一次：
 
 ```python
-
 import tvm
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -46,7 +43,7 @@ from tvm.tirx.cuda.operator.tile_primitive.tma_utils import tma_shared_layout, S
 from tvm.tirx.layout import TileLayout, S, TLane, TCol, tid_in_wg
 ```
 
-We wrap the kernel in a small builder, `hgemm_v1(M, N, K)`, that takes the problem shape and returns a `PrimFunc`. For our chosen shape, `M=N=128, K=64`, the launch happens to contain exactly one output tile, which is what keeps this first version simple enough to read in one sitting:
+我们将内核包装在一个小构建器 `hgemm_v1(M, N, K)` 中，它接受问题形状并返回 `PrimFunc`。对于我们选择的形状 `M=N=128, K=64`，启动恰好包含一个输出块，这使第一个版本足够简单，可以一次读完：
 
 ```python
 def hgemm_v1(M, N, K):
@@ -56,9 +53,9 @@ def hgemm_v1(M, N, K):
     acc_type = tvm.DataType("float32")
 
     BLK_M, BLK_N, BLK_K = 128, 128, 64
-    # MMA_M/MMA_N/MMA_K document the underlying hardware MMA tile; they are not
-    # passed to gemm_async (which derives the MMA shape from the operand and
-    # accumulator tiles), so the later steps omit them.
+    # MMA_M/MMA_N/MMA_K 记录底层硬件 MMA 块；它们不传递给
+    # gemm_async（它从操作数和累加器块推导 MMA 形状），
+    # 所以后续步骤省略它们。
     MMA_M, MMA_N, MMA_K = 128, 128, 16
 
     A_layout = tma_shared_layout(a_type, SwizzleMode.SWIZZLE_128B_ATOM, (BLK_M, BLK_K))
@@ -71,15 +68,15 @@ def hgemm_v1(M, N, K):
         D: T.Buffer((M, N), d_type),
     ):
         T.device_entry()
-        # Step 1 is a single-tile kernel: M = BLK_M and N = BLK_N, so the grid
-        # is 1x1. Starting with a 1x1 grid keeps the per-CTA tile offsets
-        # (m_st, n_st) trivially zero; Steps 3+ generalise this to larger M / N.
+        # 第 1 步是单块内核：M = BLK_M 且 N = BLK_N，所以网格
+        # 是 1x1。从 1x1 网格开始使每 CTA 块偏移
+        # (m_st, n_st) 平凡地为零；第 3 步+ 将此推广到更大的 M / N。
         bx, by = T.cta_id([M // BLK_M, N // BLK_N])
-        wg_id = T.warpgroup_id([1])      # single warpgroup, so wg_id is always 0 (unused below)
+        wg_id = T.warpgroup_id([1])      # 单 warpgroup，所以 wg_id 总是 0（下面未使用）
         warp_id = T.warp_id_in_wg([4])
         lane_id = T.lane_id([32])
     
-        # --- SMEM allocation ---
+        # --- SMEM 分配 ---
         pool = T.SMEMPool()
         tmem_addr = pool.alloc((1,), "uint32")
         mma_bar = pool.alloc((1,), "uint64", align=8)
@@ -88,7 +85,7 @@ def hgemm_v1(M, N, K):
         Bsmem = pool.alloc((BLK_N, BLK_K), b_type, layout=B_layout)
         pool.commit()
     
-        # --- Barrier + TMEM init (warp 0 only) ---
+        # --- 屏障 + TMEM 初始化（仅 warp 0） ---
         if warp_id == 0:
             if lane_id == 0:
                 T.ptx.mbarrier.init(mma_bar.ptr_to([0]), 1)
@@ -107,14 +104,14 @@ def hgemm_v1(M, N, K):
         n_st = T.meta_var(by * BLK_N)
         phase_mma: T.int32 = 0
     
-        # --- Load: all threads copy global -> shared (synchronous).
-        # With M=BLK_M and N=BLK_N the slices below cover the full matrices;
-        # the slice form is kept so the diff to Step 3 (multi-tile) is minimal.
+        # --- 加载：所有线程复制全局 -> 共享（同步）。 ---
+        # 当 M=BLK_M 且 N=BLK_N 时，下面的切片覆盖完整矩阵；
+        # 保留切片形式使与第 3 步（多块）的差异最小。
         Tx.cta.copy(Asmem[:, :], A[m_st:m_st + BLK_M, :])
         Tx.cta.copy(Bsmem[:, :], B[n_st:n_st + BLK_N, :])
         T.cuda.cta_sync()
     
-        # --- Compute: single elected thread issues MMA ---
+        # --- 计算：单个选举线程发出 MMA ---
         if warp_id == 0:
             if T.ptx.elect_sync():
                 Tx.gemm_async(
@@ -125,7 +122,7 @@ def hgemm_v1(M, N, K):
     
         T.ptx.mbarrier.try_wait(mma_bar.ptr_to([0]), phase_mma)
     
-        # --- Writeback: TMEM -> RF -> GMEM ---
+        # --- 写回：TMEM -> RF -> GMEM ---
         Dreg = T.alloc_local((BLK_N,), acc_type)
         Dreg_f16 = T.alloc_local((BLK_N,), d_type)
         Dreg_wg = Dreg.view(128, BLK_N,
@@ -136,7 +133,7 @@ def hgemm_v1(M, N, K):
         m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
         Tx.copy(D[m_thr, n_st : n_st + BLK_N], Dreg_f16[:])
     
-        # --- Deallocate TMEM ---
+        # --- 释放 TMEM ---
         T.cuda.cta_sync()
         if warp_id == 0:
             T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
@@ -145,7 +142,7 @@ def hgemm_v1(M, N, K):
     return kernel
 ```
 
-Before we read the kernel, let us make sure it works. We compile it and check its output against a torch reference. We do not have to spell out the exact architecture: the arch (e.g. `sm_100a`) is auto-detected from the device, so the target `"cuda"` is enough, and `tir_pipeline="tirx"` is what selects the TIRx lowering pipeline. Once compiled, `ex.mod(...)` takes torch tensors directly, with no manual conversion in between.
+在阅读内核之前，让我们确保它能工作。我们编译它并将其输出与 torch 参考进行比较。我们不必指定确切的架构：架构（例如 `sm_100a`）从设备自动检测，所以目标 `"cuda"` 就足够了，`tir_pipeline="tirx"` 是选择 TIRx 降低流水线的选项。编译后，`ex.mod(...)` 直接接受 torch 张量，无需手动转换。
 
 ```python
 import torch
@@ -164,7 +161,7 @@ A_tensor = torch.randn(M, K, dtype=torch.float16, device=device)
 B_tensor = torch.randn(N, K, dtype=torch.float16, device=device)
 D_tensor = torch.zeros(M, N, dtype=torch.float16, device=device)
 
-# ex.mod(...) takes torch tensors directly, the same call form used in every chapter.
+# ex.mod(...) 直接接受 torch 张量，每章使用相同的调用形式。
 ex.mod(A_tensor, B_tensor, D_tensor)
 
 D_ref = (A_tensor.float() @ B_tensor.float().T).half()
@@ -174,51 +171,51 @@ torch.testing.assert_close(D_tensor, D_ref, rtol=2e-2, atol=1e-2)
 print("PASS")
 ```
 
-## Scope, Layout, Dispatch
+## 作用域、布局、调度
 
-Now that the kernel runs, we can read it back and ask what its lines actually decide. Seen this way, the whole kernel is a set of choices along three design elements. Every operation in it answers the same three questions, *who* runs it, *where* its data lives, and *how* it executes, and those three answers are exactly scope, layout, and dispatch. The rest of this section takes the design elements one at a time; the interactive demo below lets you see which lines each design element controls.
+现在内核运行了，我们可以回顾它并问它的行实际上决定了什么。从这个角度看，整个内核是一组沿三个设计元素的选择。其中每个操作都回答相同的三个问题：*谁*运行它，*哪里*它的数据存在，以及*如何*执行它，这三个答案正是作用域、布局和调度。本节接下来逐一介绍设计元素；下面的交互演示让你看到每个设计元素控制哪些行。
 
 ```{raw} html
-<iframe src="../demo/tirx_dispatch.html" title="TIRx: scope, layout, dispatch" loading="lazy"
+<iframe src="../demo/tirx_dispatch.html" title="TIRx：作用域、布局、调度" loading="lazy"
         style="width:100%; min-width:960px; height:640px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 ```
-*Interactive: click Scope / Layout / Dispatch to spotlight the lines of the kernel each design element controls.*
+*交互演示：点击作用域 / 布局 / 调度以聚焦每个设计元素控制的内核行。*
 
-When you use the demo, watch for three questions:
+使用演示时，注意三个问题：
 
-- **Scope: who runs the operation?** `Tx.cta.copy(...)` is CTA-scoped, so all 128 threads help with the GMEM -> SMEM copy. `Tx.gemm_async(...)` is issued once by an elected thread, because each lowered `tcgen05.mma` instruction is already a cooperative MMA launch. `Tx.wg.copy_async(...)` is warpgroup-scoped, so the warpgroup's 128 threads split the TMEM readback row by row.
-- **Layout: where does each tile live?** A and B use the swizzled SMEM layouts that `tcgen05.mma` expects. The accumulator lives in TMEM under a `TLane`/`TCol` layout. The register readback view maps rows onto `tid_in_wg`, so each warpgroup thread owns one row fragment.
-- **Dispatch: which hardware path executes it?** `Tx.gemm_async(..., dispatch="tcgen05", ...)` selects the Blackwell Tensor Core path. The copy operations have dispatch choices too: this first kernel uses ordinary thread copies, and later GEMM steps swap those copies for TMA without changing the surrounding scope or layout.
+- **作用域：谁运行操作？** `Tx.cta.copy(...)` 是 CTA 作用域的，所以所有 128 个线程帮助 GMEM → SMEM 复制。`Tx.gemm_async(...)` 由一个选举线程发出一次，因为每个降低的 `tcgen05.mma` 指令已经是一个协作 MMA 启动。`Tx.wg.copy_async(...)` 是 warpgroup 作用域的，所以 warpgroup 的 128 个线程逐行拆分 TMEM 回读。
+- **布局：每个块存在于何处？** A 和 B 使用 `tcgen05.mma` 期望的 swizzled SMEM 布局。累加器在 TMEM 中，使用 `TLane`/`TCol` 布局。寄存器回读视图将行映射到 `tid_in_wg`，所以每个 warpgroup 线程拥有一个行片段。
+- **调度：哪条硬件路径执行它？** `Tx.gemm_async(..., dispatch="tcgen05", ...)` 选择 Blackwell 张量核心路径。复制操作也有调度选择：这个第一个内核使用普通线程复制，后续 GEMM 步骤将这些复制替换为 TMA，而不改变周围的作用域或布局。
 
-**Try with your agent**: Pick three lines from the first kernel: one copy, one MMA, and one TMEM readback. Ask it to label each line by scope, layout, and dispatch, then check whether the answer matches the guards, buffer layouts, and `dispatch=` argument in the code.
+**试一试**：从第一个内核中选三行：一个复制、一个 MMA 和一个 TMEM 回读。让 agent 按作用域、布局和调度标记每行，然后检查答案是否与代码中的守卫、缓冲区布局和 `dispatch=` 参数匹配。
 
-## How Compilation Works
+## 编译如何工作
 
-We already compiled the kernel above to test it; now we look a little closer at what that step does. The recipe is short: wrap the `PrimFunc` in an `IRModule` and hand it to `tvm.compile(mod, target=..., tir_pipeline="tirx")`. This runs the TIRx lowering pipeline and hands back an `Executable` that you call directly.
+我们已经在上面编译了内核来测试它；现在我们更仔细地看看那一步做了什么。方法很短：将 `PrimFunc` 包装在 `IRModule` 中并交给 `tvm.compile(mod, target=..., tir_pipeline="tirx")`。这运行 TIRx 降低流水线并返回你可以直接调用的 `Executable`。
 
 ```python
 target = tvm.target.Target("cuda")
 ex = tvm.compile(tvm.IRModule({"main": kernel}), target=target, tir_pipeline="tirx")
 ```
 
-It is worth knowing, at least in outline, what `tir_pipeline="tirx"` sets in motion. The pipeline's central pass, `LowerTIRx`, resolves each tile primitive against its scope / layout / dispatch contract: this is where the three design elements we just discussed are actually cashed out into instructions. After that, the usual host/device split and a finalize step produce the launchable module. If you prefer, you can also compile inside a `with target:` block, which lets the kernel pick up the surrounding target context.
+值得至少大致了解 `tir_pipeline="tirx"` 启动了什么。流水线的核心传递 `LowerTIRx` 解析每个块原语与其作用域/布局/调度契约：这是我们刚才讨论的三个设计元素实际兑现为指令的地方。之后，常规的主机/设备分离和最终化步骤产生可启动的模块。如果你愿意，你也可以在 `with target:` 块内编译，让内核获取周围的目标上下文。
 
-One nice property of this flow is that nothing is hidden from you: the result can be inspected at both levels. You can read the IR itself with `.show()` or `.script()`, and you can read the CUDA C that the compiler ultimately emitted straight off the compiled module.
+这个流程的一个好特性是没有什么对你隐藏：结果可以在两个级别检查。你可以用 `.show()` 或 `.script()` 阅读 IR 本身，也可以直接从编译后的模块阅读编译器最终发出的 CUDA C。
 
 ```python
-kernel.show()                          # pretty-print the TIRx (TVMScript)
-print(kernel.script())                 # ... the same, as a string
+kernel.show()                          # 美化打印 TIRx（TVMScript）
+print(kernel.script())                 # ... 相同，作为字符串
 
-# the generated CUDA C source, from the compiled Executable:
+# 生成的 CUDA C 源码，来自编译后的 Executable：
 print(ex.mod.imports[0].inspect_source())
 ```
 
-This is only a sketch. For the full lowering story, covering all of the passes, how tile-primitive dispatch is resolved, and how the host/device split is done, see {ref}`chap_arch`.
+这只是一个概要。完整的降低故事，涵盖所有传递、块原语调度如何解析，以及主机/设备分离如何完成，请参见 {ref}`chap_arch`。
 
-## Where to Go Next
+## 接下来去哪里
 
-One kernel was enough to meet scope, layout, and dispatch and to see them compiled and run. Each of the three design elements, and the kernel itself, opens onto a chapter that takes it further:
+一个内核足以认识作用域、布局和调度，并看到它们编译和运行。三个设计元素中的每一个，以及内核本身，都打开一个章节将其进一步推进：
 
-- {ref}`chap_tirx_layout_api`: the tensor layout model (`TileLayout`, named axes, swizzle) that the operand and accumulator placements above are built from. Start here if the layout design element felt like the most mysterious of the three.
-- {ref}`chap_language_reference`: the full language-feature set, covering parser utilities, data types, buffers and memory, control flow, and thread synchronization, for when you want the complete vocabulary rather than the tour.
-- {ref}`chap_gemm_basics`: this kernel as Step 1 of the GEMM optimization path, built up through K-loop accumulation, spatial tiling, TMA, and warp specialization. This is the natural next stop if you want to see the same three design elements scale up to a real kernel.
+- {ref}`chap_tirx_layout_api`：张量布局模型（`TileLayout`、命名轴、swizzle），上面的操作数和累加器放置就是建立在此之上。如果布局设计元素感觉是三个中最神秘的，从这里开始。
+- {ref}`chap_language_reference`：完整的语言特性集，涵盖解析器工具、数据类型、缓冲区和内存、控制流和线程同步，当你需要完整词汇表而不仅仅是导览时。
+- {ref}`chap_gemm_basics`：这个内核作为 GEMM 优化路径的第 1 步，通过 K 循环累加、空间分块、TMA 和 warp 特化构建。如果你想看相同的三个设计元素扩展到真实内核，这是自然的下一站。

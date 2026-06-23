@@ -1,258 +1,258 @@
 (chap_performance)=
-# What Makes a Kernel Fast
+# 什么让内核变快
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- The roofline model gives a kernel a performance ceiling. The ceiling is set by either memory bandwidth or compute throughput.
-- Arithmetic intensity decides which ceiling applies. It is the amount of useful arithmetic work done per byte moved.
-- Low arithmetic intensity means the kernel is memory-bound. The main ways out are to move fewer bytes, reuse data more, fuse operations, or use smaller dtypes.
-- High arithmetic intensity means the kernel can be compute-bound. The main task is then to keep the Tensor Cores busy.
-- In modern GPU kernels, the main lever is overlap. TMA, Tensor Cores, epilogues, and stores should run at the same time whenever the dependency graph allows it.
+- 屋顶线模型为内核设定性能上限。上限由内存带宽或计算吞吐量决定。
+- 算术强度决定哪个上限适用。它是每搬运字节完成的有用算术工作量。
+- 低算术强度意味着内核受内存限制。主要出路是搬运更少字节、更多重用数据、融合操作或使用更小的数据类型。
+- 高算术强度意味着内核可以受计算限制。主要任务是保持张量核心忙碌。
+- 在现代 GPU 内核中，主要杠杆是重叠。TMA、张量核心、尾声代码和存储应在依赖图允许时同时运行。
 :::
 
-A kernel is only fast relative to a ceiling. A number like 330 TFLOP/s may look large by itself, but it means something very different on a GPU that can sustain on the order of 2 PFLOP/s on dense fp16 or bf16 Tensor Core work. Without a ceiling, it is hard to tell whether a kernel is close to the hardware limit or still leaving most of the chip idle.
+内核只有相对于一个上限才是快的。像 330 TFLOP/s 这样的数字本身可能看起来很大，但在能在密集 fp16 或 bf16 张量核心工作上维持约 2 PFLOP/s 的 GPU 上，它意味着非常不同的东西。没有上限，很难判断内核是接近硬件限制还是仍然让大部分芯片空闲。
 
-The roofline model gives that ceiling. It separates the kernel into two basic activities: moving bytes and doing arithmetic. If the kernel cannot move data fast enough, memory bandwidth sets the limit. If the kernel has enough data reuse and enough arithmetic work, compute throughput sets the limit.
+屋顶线模型给出那个上限。它将内核分为两个基本活动：搬运字节和做算术。如果内核不能足够快地移动数据，内存带宽设定限制。如果内核有足够的数据重用和足够的算术工作，计算吞吐量设定限制。
 
-The numbers in this chapter use the NVIDIA B200 as the running example. Following the convention from {ref}`chap_background`, we use round ceilings for reasoning: roughly 2 PFLOP/s of dense fp16 or bf16 Tensor Core throughput, and roughly 8 TB/s of HBM3e bandwidth. The exact values depend on the specific device, clock, power limit, and measurement setup, so they should be read as order-of-magnitude limits rather than datasheet constants.
+本章的数字使用 NVIDIA B200 作为示例。按照 {ref}`chap_background` 的惯例，我们使用整数上限进行推理：大约 2 PFLOP/s 的密集 fp16 或 bf16 张量核心吞吐量，以及大约 8 TB/s 的 HBM3e 带宽。确切值取决于特定设备、时钟、功率限制和测量设置，因此应将其视为数量级限制而非数据表常数。
 
-## The Roofline Model
+## 屋顶线模型
 
-Every kernel moves data and does arithmetic. The roofline model bounds the kernel by the slower of those two paths.
+每个内核都移动数据并做算术。屋顶线模型用这两条路径中较慢的一条来约束内核。
 
-The compute ceiling is the maximum arithmetic throughput of the hardware. For a Tensor Core GEMM on B200, the relevant ceiling is the Tensor Core throughput. For a scalar or elementwise kernel, the relevant ceiling may instead be CUDA core throughput or another functional unit.
+计算上限是硬件的最大算术吞吐量。对于 B200 上的张量核心 GEMM，相关上限是张量核心吞吐量。对于标量或逐元素内核，相关上限可能是 CUDA 核心吞吐量或其他功能单元。
 
-The memory ceiling is bandwidth multiplied by arithmetic intensity. If a kernel does little arithmetic for each byte moved, memory bandwidth limits performance. If it does many operations per byte, memory is less likely to be the limiting factor.
+内存上限是带宽乘以算术强度。如果内核对每个搬运的字节做很少算术，内存带宽限制性能。如果它对每个字节做很多操作，内存不太可能是限制因素。
 
-The basic roofline bound is:
-
-```text
-attainable FLOP/s <= min(peak FLOP/s, memory bandwidth * arithmetic intensity)
-```
-
-Arithmetic intensity is:
+基本屋顶线约束是：
 
 ```text
-arithmetic intensity = useful FLOPs / bytes moved
+可达 FLOP/s <= min(峰值 FLOP/s, 内存带宽 * 算术强度)
 ```
 
-The memory level must be specified. For an HBM roofline, the bytes are HBM bytes. For an L2 roofline, they are L2 bytes. For an SMEM roofline, they are shared memory bytes. In this chapter, the default roofline is the HBM roofline.
-
-On a roofline plot, the x axis is arithmetic intensity, measured in FLOP per byte. The y axis is attainable performance. The memory roof is a sloped line:
+算术强度是：
 
 ```text
-performance = bandwidth * arithmetic intensity
+算术强度 = 有用 FLOP / 搬运的字节
 ```
 
-The compute roof is a flat line:
+必须指定内存级别。对于 HBM 屋顶线，字节是 HBM 字节。对于 L2 屋顶线，是 L2 字节。对于 SMEM 屋顶线，是共享内存字节。本章默认的屋顶线是 HBM 屋顶线。
+
+在屋顶线图上，x 轴是算术强度，以每字节 FLOP 为单位。y 轴是可达性能。内存屋顶是一条斜线：
 
 ```text
-performance = peak FLOP/s
+性能 = 带宽 * 算术强度
 ```
 
-The two meet at the ridge point:
+计算屋顶是一条平线：
 
 ```text
-ridge point = peak FLOP/s / bandwidth
+性能 = 峰值 FLOP/s
 ```
 
-For the B200 round numbers used here:
+两者在脊点相遇：
 
 ```text
-ridge point ≈ 2000 TFLOP/s / 8 TB/s
-            ≈ 250 FLOP/byte
+脊点 = 峰值 FLOP/s / 带宽
 ```
 
-A kernel below that arithmetic intensity is memory-bound under the HBM roofline. It cannot reach peak Tensor Core throughput because it cannot deliver enough bytes per second to feed that much arithmetic.
-
-A kernel above that arithmetic intensity can be compute-bound. At that point, memory traffic is no longer the first-order limit. The remaining job is to drive the compute units well enough to approach the flat roof.
-
-The useful part of the roofline model is not the plot itself. The useful part is that it tells the programmer which resource is binding. A memory-bound kernel does not become fast because its math instructions are slightly better. A compute-bound kernel does not become fast because it saves a few irrelevant bytes. The first step is to know which side of the ridge the kernel is on.
-
-![A B200 roofline with example workloads, showing the memory roof, the compute roof, and the ridge point](../img/roofline.png)
-
-## Arithmetic Intensity of Common Workloads
-
-Arithmetic intensity is often an algorithm property before it is an implementation detail. A rough estimate can usually be made before writing the kernel.
-
-### Elementwise and Reductions
-
-Elementwise kernels, such as GELU, and reduction-style kernels, such as RMSNorm, read and write large tensors while doing only a small number of FLOPs per element.
-
-Their arithmetic intensity is low. They sit far to the left of the ridge point. The best version of such a kernel usually tries to approach the memory bandwidth roof, not the Tensor Core compute roof.
-
-For these kernels, the important questions are mechanical:
+对于此处使用的 B200 整数：
 
 ```text
-Are the loads and stores coalesced?
-Are bytes moved only once?
-Can the operation be fused with a producer or consumer?
-Can the dtype be smaller?
-Can TMA or vectorized accesses help?
+脊点 ≈ 2000 TFLOP/s / 8 TB/s
+     ≈ 250 FLOP/字节
 ```
 
-If there is no reuse and no fusion opportunity, the memory roof is the real ceiling.
+低于该算术强度的内核在 HBM 屋顶线下受内存限制。它无法达到峰值张量核心吞吐量，因为它无法提供足够字节/秒来喂饱那么多算术。
+
+高于该算术强度的内核可以受计算限制。在那一点上，内存流量不再是首要限制。剩余工作是充分驱动计算单元以接近平屋顶。
+
+屋顶线模型有用的部分不是图本身。有用的部分是它告诉程序员哪个资源是约束。受内存限制的内核不会因为其数学指令稍好而变快。受计算限制的内核不会因为节省几个无关字节而变快。第一步是知道内核在脊点的哪一侧。
+
+![带示例工作负载的 B200 屋顶线，显示内存屋顶、计算屋顶和脊点](../img/roofline.png)
+
+## 常见工作负载的算术强度
+
+算术强度通常是算法属性而非实现细节。通常在编写内核之前就可以进行粗略估计。
+
+### 逐元素和归约
+
+逐元素内核（如 GELU）和归约式内核（如 RMSNorm）读写大型张量，同时每个元素只做少量 FLOP。
+
+它们的算术强度很低。它们位于脊点的左侧很远。这类内核的最好版本通常试图接近内存带宽屋顶，而不是张量核心计算屋顶。
+
+对于这些内核，重要的问题是机械的：
+
+```text
+加载和存储是否合并？
+字节是否只搬运一次？
+操作是否可以与生产者或消费者融合？
+数据类型是否可以更小？
+TMA 或向量化访问是否有帮助？
+```
+
+如果没有重用和融合机会，内存屋顶是真正的上限。
 
 ### GEMM
 
-GEMM is the opposite case. Its arithmetic intensity grows with problem size because each loaded tile can be reused for many multiply-accumulate operations.
+GEMM 是相反的情况。其算术强度随问题规模增长，因为每个加载的块可以重用于许多乘加操作。
 
-For a square fp16 matmul with `M = N = K`, the ideal arithmetic intensity is approximately:
+对于 `M = N = K` 的方阵 fp16 矩阵乘法，理想算术强度大约是：
 
 ```text
 AI ≈ 2N^3 / (3 * 2N^2)
-   = N / 3 FLOP/byte
+   = N / 3 FLOP/字节
 ```
 
-This estimate assumes A and B are read once, C is written once, beta is zero, on-chip reuse is perfect, and there is no extra metadata, padding, or redundant traffic. Real kernels move more data than this ideal model. But the estimate is still useful.
+这个估计假设 A 和 B 只读取一次，C 只写入一次，beta 为零，片上重用完美，没有额外元数据、填充或冗余流量。实际内核比这个理想模型搬运更多数据。但估计仍然有用。
 
-At `N = 4096`:
+在 `N = 4096` 时：
 
 ```text
 AI ≈ 4096 / 3
-   ≈ 1365 FLOP/byte
+   ≈ 1365 FLOP/字节
 ```
 
-That is well to the right of the B200 ridge point of roughly 250 FLOP/byte. Large GEMM is therefore compute-bound under the HBM roofline. The goal is not merely to reduce HBM traffic. The goal is to use Tensor Cores, keep them fed, and overlap data movement with compute so the compute roof becomes reachable.
+这远在 B200 约 250 FLOP/字节脊点的右侧。因此大型 GEMM 在 HBM 屋顶线下受计算限制。目标不仅仅是减少 HBM 流量。目标是使用张量核心，保持它们供给充足，并将数据搬运与计算重叠，使计算屋顶变得可达。
 
-This is why a naive GEMM can be slow even though GEMM has high arithmetic intensity. The algorithm permits high performance, but the implementation may leave the Tensor Cores idle.
+这就是为什么朴素 GEMM 即使 GEMM 具有高算术强度也可能很慢。算法允许高性能，但实现可能让张量核心空闲。
 
-### Attention
+### 注意力
 
-Attention sits between these extremes. Its arithmetic intensity depends on sequence length, head dimension, tiling, masking, and whether intermediate tensors are materialized.
+注意力介于这些极端之间。其算术强度取决于序列长度、头维度、分块、掩码以及中间张量是否被具体化。
 
-The key problem in standard attention is the score matrix. If the kernel writes the score matrix to HBM and later reads it back, it moves a large intermediate through memory. Flash Attention ({ref}`chap_flash_attention`) raises arithmetic intensity by keeping the relevant tiles on chip and avoiding that HBM round trip.
+标准注意力中的关键问题是分数矩阵。如果内核将分数矩阵写入 HBM 然后稍后读回，它通过内存搬运大量中间数据。Flash Attention（{ref}`chap_flash_attention`）通过将相关块保持在片上并避免该 HBM 往返来提高算术强度。
 
-So attention optimization is partly a roofline problem and partly a scheduling problem. The algorithm is changed so that fewer bytes go to HBM. Then the kernel is scheduled so that the remaining movement and compute overlap.
+因此注意力优化部分是屋顶线问题，部分是调度问题。改变算法使更少字节进入 HBM。然后调度内核使剩余的搬运和计算重叠。
 
-## When Arithmetic Intensity Is Low
+## 当算术强度低时
 
-If a kernel is left of the ridge, it is memory-bound. The Tensor Cores or CUDA cores may be idle because the bottleneck is bytes, not arithmetic instructions.
+如果内核在脊点左侧，它受内存限制。张量核心或 CUDA 核心可能空闲，因为瓶颈是字节而不是算术指令。
 
-There are two responses.
+有两种应对方式。
 
-The first response is to raise arithmetic intensity. This is the higher-leverage path because it can move the kernel toward the compute-bound region.
+第一种是提高算术强度。这是更高杠杆的路径，因为它可以将内核移向受计算限制的区域。
 
-The most important technique is fusion. A common source of low arithmetic intensity is writing an intermediate tensor to HBM and reading it back immediately in the next operation. Fusing the producer and consumer keeps that intermediate in registers, SMEM, or TMEM. The HBM round trip disappears.
+最重要的技术是融合。低算术强度的常见来源是将中间张量写入 HBM 然后在下一个操作中立即读回。融合生产者和消费者将该中间结果保存在寄存器、SMEM 或 TMEM 中。HBM 往返消失了。
 
-Examples include:
+例子包括：
 
 ```text
-GEMM plus elementwise epilogue
-normalization folded into a neighboring op
-attention computed without materializing the full score matrix
+GEMM 加逐元素尾声
+归约折叠到相邻操作中
+注意力计算而不具体化完整分数矩阵
 ```
 
-The second technique is blocking for reuse. If a tile is loaded once and used many times before eviction, each byte supports more arithmetic work. GEMM gets its high arithmetic intensity from exactly this reuse. Other workloads can use the same idea whenever they have repeated use of a tile.
+第二种技术是分块重用。如果一个块加载一次并在驱逐前使用多次，每个字节支持更多算术工作。GEMM 正是从这种重用中获得其高算术强度。其他工作负载只要对块有重复使用就可以使用相同思路。
 
-The third technique is reducing the number of bytes per value. Moving from fp32 to fp16, fp8, or fp4 reduces traffic and increases FLOPs per byte. The real gain is smaller than the raw dtype ratio when the format needs metadata, scale factors, or extra conversion work. Block-scaled fp8 and fp4 are examples of this. Even so, smaller dtypes are often one of the most direct ways to move a kernel rightward on the roofline.
+第三种技术是减少每个值的字节数。从 fp32 到 fp16、fp8 或 fp4 减少流量并增加每字节 FLOP。当格式需要元数据、缩放因子或额外转换工作时，实际增益小于原始数据类型比率。分块缩放 fp8 和 fp4 就是这方面的例子。即便如此，更小的数据类型通常是将内核在屋顶线上向右移动的最直接方式之一。
 
-The second response is to accept the memory roof and try to reach it. Some kernels do not have enough work to fuse or enough reuse to exploit. A pure copy, a simple elementwise operation, or a single-pass reduction over a large tensor may be fundamentally memory-bound.
+第二种方式是接受内存屋顶并试图达到它。一些内核没有足够的工作可融合或足够的重用可利用。纯复制、简单的逐元素操作或对大型张量的单遍归约可能是根本受内存限制的。
 
-In that case, the goal is not to beat the roof. The goal is to saturate it.
+在这种情况下，目标不是击败屋顶。目标是饱和它。
 
-That means:
+这意味着：
 
 ```text
-move each byte once
-avoid redundant reads
-use coalesced or vectorized accesses
-use TMA for regular bulk tiles
-keep enough memory requests in flight
-use smaller storage dtypes when the algorithm allows it
+每个字节只搬运一次
+避免冗余读取
+使用合并或向量化访问
+对规则批量块使用 TMA
+保持足够的内存请求在飞行中
+算法允许时使用更小的存储数据类型
 ```
 
-Once a memory-bound kernel reaches the memory roof, further compute optimization does not help. The only way to go faster is to change the algorithm so it moves fewer bytes.
+一旦受内存限制的内核达到内存屋顶，进一步的计算优化没有帮助。更快的唯一方式是改变算法使它搬运更少字节。
 
-## The Optimization Ladder
+## 优化阶梯
 
-The roofline says what is possible. It does not say how easy it is to reach that limit.
+屋顶线说明了什么是可能的。它没有说明达到那个限制有多容易。
 
-A large fp16 GEMM may be compute-bound in theory. That only means the HBM roof is not the main limit. It does not mean any implementation will reach the Tensor Core roof. Closing the gap requires the right instructions, layouts, staging, synchronization, and scheduling.
+大型 fp16 GEMM 在理论上可能受计算限制。这只意味着 HBM 屋顶不是主要限制。它不意味着任何实现都会达到张量核心屋顶。缩小差距需要正确的指令、布局、暂存、同步和调度。
 
-The GEMM kernels in Part III show this as a sequence of steps on B200 ({ref}`chap_gemm_advanced`). Each step keeps the same basic algorithm but changes how the tile is computed or scheduled.
+第三部分的 GEMM 内核在 B200 上将其显示为一系列步骤（{ref}`chap_gemm_advanced`）。每个步骤保持相同的基本算法，但改变块的计算或调度方式。
 
-The first large measured jump in the GEMM ladder is the move from the thread-copy tiled path to the TMA-backed path. TMA takes regular GMEM -> SMEM tile movement off the CTA threads and lets the kernel feed Tensor Cores through hardware-managed bulk copies.
+GEMM 阶梯中第一个大的测量跳跃是从线程复制分块路径到 TMA 支持的路径。TMA 将常规 GMEM → SMEM 块移动从 CTA 线程中取出，让内核通过硬件管理的批量复制喂养张量核心。
 
-After that first jump, the main improvements come from overlap and scheduling. TMA brings future tiles into shared memory. `tcgen05.mma` runs asynchronously. The epilogue drains previous results. Software pipelining and warp specialization arrange those pieces so that the hardware engines are active at the same time.
+第一个跳跃之后，主要改进来自重叠和调度。TMA 将未来块带入共享内存。`tcgen05.mma` 异步运行。尾声代码排空先前结果。软件流水线和 warp 特化安排这些部分，使硬件引擎同时活跃。
 
-There is also no rule that every intermediate step must be faster by itself. A step such as warp specialization may temporarily spend resources on a structure that does not immediately improve the number. It can still be the right step if it enables later overlap that the simpler structure could not express.
+也没有规则说每个中间步骤本身必须更快。像 warp 特化这样的步骤可能暂时将资源花在不会立即改善数字的结构上。如果它使后续重叠成为可能，而更简单的结构无法表达，它仍然是正确的步骤。
 
-![The GEMM optimization journey on B200: measured points from a synchronous tiled baseline through TMA, warp specialization, CTA clusters, and multi-consumer execution](../img/gemm_perf.png)
+![B200 上的 GEMM 优化之旅：从同步分块基线经过 TMA、warp 特化、CTA 集群和多消费者执行的测量点](../img/gemm_perf.png)
 
-## Overlap Is the Main Lever
+## 重叠是主要杠杆
 
-Once a GEMM is compute-bound and already uses Tensor Cores, the remaining gap usually comes from idle time.
+一旦 GEMM 受计算限制并已使用张量核心，剩余差距通常来自空闲时间。
 
-A simple kernel might do this:
+简单内核可能这样做：
 
 ```text
-load tile k
-compute tile k
-store tile k
-load tile k + 1
-compute tile k + 1
-store tile k + 1
+加载块 k
+计算块 k
+存储块 k
+加载块 k+1
+计算块 k+1
+存储块 k+1
 ```
 
-That schedule leaves hardware idle. While the load runs, the Tensor Core waits. While the Tensor Core runs, the copy engine may be idle. While the store drains, both may be waiting.
+该调度让硬件空闲。加载运行时，张量核心等待。张量核心运行时，复制引擎可能空闲。存储排空时，两者都可能在等待。
 
-A pipelined kernel instead tries to run independent stages together:
+流水线化内核 instead 试图同时运行独立阶段：
 
 ```text
-load tile k + 1
-compute tile k
-store tile k - 1
+加载块 k+1
+计算块 k
+存储块 k-1
 ```
 
-This is the central idea behind the Blackwell kernel structure used later in the book. TMA handles asynchronous data movement. `tcgen05.mma` handles asynchronous Tensor Core work. The epilogue and stores handle the output side. `mbarrier` objects connect the stages so that each consumer waits only when the data it needs is actually required.
+这是本书后面使用的 Blackwell 内核结构背后的核心思想。TMA 处理异步数据搬运。`tcgen05.mma` 处理异步张量核心工作。尾声和存储处理输出侧。`mbarrier` 对象连接阶段，使每个消费者仅在其实际需要的数据被需要时才等待。
 
-The point is not to remove dependencies. The point is to schedule around them. The MMA for tile `k` cannot start until tile `k` is loaded. The epilogue for tile `k` cannot read the accumulator until the MMA for tile `k` is complete. But the load for tile `k + 1` can often run while the MMA for tile `k` is in flight, and the store for tile `k - 1` can often drain at the same time.
+重点不是消除依赖。重点是围绕它们调度。块 `k` 的 MMA 在块 `k` 加载完成之前不能开始。块 `k` 的尾声在块 `k` 的 MMA 完成之前不能读取累加器。但块 `k+1` 的加载通常可以在块 `k` 的 MMA 进行中运行，块 `k-1` 的存储通常可以同时排空。
 
-This is why so many later chapters focus on asynchronous mechanisms:
+这就是为什么后面许多章节专注于异步机制：
 
 ```text
-TMA for global memory to shared memory movement
-mbarriers for load completion and resource handoff
-tcgen05 for asynchronous Tensor Core compute
-TMEM for long-lived accumulators
-warp specialization to separate producer and consumer roles
-clusters for larger cooperative tiles and multicast
+TMA 用于全局内存到共享内存的移动
+mbarrier 用于加载完成和资源交接
+tcgen05 用于异步张量核心计算
+TMEM 用于长期存在的累加器
+warp 特化用于分离生产者和消费者角色
+集群用于更大的协作块和多播
 ```
 
-They are different mechanisms, but they serve the same scheduling goal: keep useful work running on more than one hardware path at once.
+它们是不同的机制，但服务于相同的调度目标：让有用工作同时在多条硬件路径上运行。
 
-## Occupancy and Resource Pressure
+## 占用率和资源压力
 
-Overlap is not the only latency-hiding mechanism. The older and more general mechanism is occupancy.
+重叠不是唯一的延迟隐藏机制。更老且更通用的机制是占用率。
 
-Occupancy is the amount of work resident on an SM. If one warp stalls, the scheduler can run another warp that is ready. This hides latency by keeping a pool of independent warps available.
+占用率是 SM 上驻留的工作量。如果一个 warp 停顿，调度器可以运行另一个就绪的 warp。这通过保持一池独立 warp 可用来隐藏延迟。
 
-Occupancy is limited by per-SM resources. The main limits are registers, shared memory, warp slots, and CTA slots. A kernel that uses many registers per thread or a large amount of shared memory per CTA may have low occupancy because only a small number of CTAs or warps can fit on the SM.
+占用率受每 SM 资源限制。主要限制是寄存器、共享内存、warp 槽和 CTA 槽。使用大量每线程寄存器或大量每 CTA 共享内存的内核可能占用率低，因为只有少量 CTA 或 warp 能容纳在 SM 上。
 
-Many modern Tensor Core kernels intentionally spend resources in ways that reduce occupancy. Multi-stage shared memory pipelines consume SMEM. Large register fragments consume registers. TMEM allocations consume Tensor Memory capacity. Warp specialization may reserve whole warps for producer or consumer roles.
+许多现代张量核心内核故意以降低占用率的方式使用资源。多阶段共享内存流水线消耗 SMEM。大型寄存器片段消耗寄存器。TMEM 分配消耗张量内存容量。Warp 特化可能为生产者或消费者角色保留整个 warp。
 
-The trade is deliberate. Instead of hiding latency by having many unrelated warps resident, these kernels hide latency through explicit overlap inside a smaller number of resident CTAs. A low-occupancy kernel can still be fast if its pipeline keeps TMA, Tensor Cores, and stores busy.
+这种权衡是刻意的。这些内核不是通过让许多不相关的 warp 驻留来隐藏延迟，而是通过在较少量驻留 CTA 内的显式重叠来隐藏延迟。低占用率内核如果其流水线保持 TMA、张量核心和存储忙碌，仍然可以很快。
 
-Neither approach is universally better. Some kernels need high occupancy because they have irregular memory access or limited explicit overlap. Others need deep staging and specialization because that is the only way to feed the Tensor Core efficiently. The right question is not whether occupancy is high. The right question is whether the active hardware units are kept busy.
+两种方法都不是普遍更好的。一些内核需要高占用率，因为它们有不规则的内存访问或有限的显式重叠。其他内核需要深度暂存和特化，因为这是高效喂养张量核心的唯一方式。正确的问题不是占用率是否高。正确的问题是活跃的硬件单元是否保持忙碌。
 
-## What This Buys Later
+## 这为后面买了什么
 
-The rest of the book keeps returning to the same diagnosis:
+本书其余部分不断回归相同的诊断：
 
 ```text
-Which roof is this kernel under?
-What resource is binding?
-What change moves the kernel closer to that roof?
+这个内核在哪个屋顶下？
+哪个资源是约束？
+什么改变使内核更接近那个屋顶？
 ```
 
-For memory-bound kernels, the answer is usually fewer bytes and better bandwidth use. That means fusion, coalescing, vectorized accesses, TMA where applicable, and smaller dtypes.
+对于受内存限制的内核，答案通常是更少字节和更好的带宽使用。这意味着融合、合并、向量化访问、适用处使用 TMA，以及更小的数据类型。
 
-For compute-bound GEMM, the answer is Tensor Cores first, then overlap. The kernel has to stage operands, issue asynchronous MMA work, keep the pipeline full, and drain the result without stalling the compute path.
+对于受计算限制的 GEMM，答案是首先张量核心，然后重叠。内核必须暂存操作数，发出异步 MMA 工作，保持流水线填满，并在不阻塞计算路径的情况下排空结果。
 
-For Flash Attention, the first move is to raise arithmetic intensity by keeping the score and probability tiles on chip. After that, it uses the same overlap tools as GEMM: tiled data movement, shared memory staging, asynchronous compute, and careful resource handoff.
+对于 Flash Attention，第一步是通过将分数和概率块保持在片上来提高算术强度。之后，它使用与 GEMM 相同的重叠工具：分块数据搬运、共享内存暂存、异步计算和仔细的资源交接。
 
-This gives a practical workflow for optimization. Estimate arithmetic intensity. Locate the roof. Decide whether the kernel is memory-bound or compute-bound. Then optimize the resource that actually sets the ceiling.
+这给出了优化的实用工作流程。估计算术强度。定位屋顶。决定内核是受内存限制还是受计算限制。然后优化实际设定上限的资源。
 
-Without that step, kernel optimization becomes guesswork. With it, each change has a reason: either it raises arithmetic intensity, moves the memory path closer to bandwidth peak, or reduces idle time under the compute roof.
+没有那个步骤，内核优化变成猜测。有了它，每个改变都有理由：要么提高算术强度，要么将内存路径移向带宽峰值，要么减少计算屋顶下的空闲时间。

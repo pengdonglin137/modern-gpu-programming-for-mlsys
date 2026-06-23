@@ -1,78 +1,78 @@
 (chap_tma)=
-# Async Data Movement: TMA
+# 异步数据搬运：TMA
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- TMA is a hardware engine for asynchronous tile copies between global memory and shared memory. One thread issues the copy, and the engine moves the bytes.
-- A TMA copy is described by a tensor-map descriptor. The descriptor tells the engine the global tensor shape, strides, tile coordinates, and shared-memory swizzle mode.
-- On the load path, TMA can swizzle the tile as it writes shared memory, so the tile lands in the layout expected by the Tensor Core.
-- TMA loads complete through an `mbarrier` with byte-count tracking. TMA stores use a commit group and wait group.
+- TMA 是用于全局内存和共享内存之间异步块复制的硬件引擎。一个线程发出复制命令，引擎搬运字节。
+- TMA 复制由张量映射描述符描述。描述符告诉引擎全局张量形状、步长、块坐标和共享内存 swizzle 模式。
+- 在加载路径上，TMA 可以在写入共享内存时对块进行 swizzle，使块直接落入张量核心期望的布局。
+- TMA 加载通过带有字节计数跟踪的 `mbarrier` 完成。TMA 存储使用提交组和等待组。
 :::
 
-A Tensor Core only helps if it has data ready to consume. In a GEMM or attention kernel, the math may be compute-bound once the pipeline is full ({ref}`chap_performance`), but the pipeline only stays full if the next operand tile arrives in time.
+张量核心只有在有数据可供消费时才有帮助。在 GEMM 或注意力内核中，一旦流水线填满，数学运算可能是计算瓶颈（{ref}`chap_performance`），但流水线只有在下一个操作数块及时到达时才能保持填满。
 
-The older way to move a tile is to have threads copy it themselves. Each thread computes addresses, issues loads from global memory, and stores values into shared memory. That works, but it spends warp instructions on address arithmetic and copy bookkeeping instead of compute. It also makes the copy path visible in the instruction stream of the same warps that are supposed to feed the Tensor Core.
+搬运块的旧方法是让线程自己复制。每个线程计算地址，从全局内存发出加载，并将值存入共享内存。这可行，但它将 warp 指令花在地址计算和复制簿记上，而不是计算上。它还使复制路径在应该为张量核心提供数据的相同 warp 的指令流中可见。
 
-The Tensor Memory Accelerator, or TMA, moves this work into a hardware copy engine. One thread issues a tile copy. The copy engine then moves a rectangular tile between global memory and shared memory asynchronously. While the engine is moving bytes, the rest of the CTA can continue with other work.
+张量内存加速器（TMA）将此工作转移到硬件复制引擎中。一个线程发出块复制命令。然后复制引擎异步地在全局内存和共享内存之间搬运矩形块。在引擎搬运字节时，CTA 的其余部分可以继续其他工作。
 
-TMA also handles part of the layout problem. A Tensor Core does not just need the right values in shared memory. It needs them in the right shared-memory layout. On the load path, TMA can apply a shared-memory swizzle as it writes the tile. That lets the tile land directly in the layout the later MMA expects.
+TMA 还处理部分布局问题。张量核心不仅需要共享内存中的正确值。它需要它们在正确的共享内存布局中。在加载路径上，TMA 可以在写入块时应用共享内存 swizzle。这使块直接落入后续 MMA 期望的布局。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe src="../demo/tma_intro.html" title="TMA: the Tensor Memory Accelerator" loading="lazy"
+<iframe src="../demo/tma_intro.html" title="TMA：张量内存加速器" loading="lazy"
         style="width:100%; min-width:1320px; height:640px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 ```
-*Interactive: TMA copying a tile from global memory to shared memory. Toggle the swizzle mode and hover a source cell to see where it lands in shared memory.*
+*交互演示：TMA 将块从全局内存复制到共享内存。切换 swizzle 模式并悬停源单元格以查看其在共享内存中的落点。*
 
-## One Thread Issues, Hardware Moves the Tile
+## 一个线程发出，硬件搬运块
 
-A TMA copy starts with one issuing thread. That thread does not loop over all elements in the tile. It gives the hardware a description of the copy, then the TMA engine performs the transfer.
+TMA 复制从一个发出线程开始。该线程不会遍历块中的所有元素。它给硬件一个复制描述，然后 TMA 引擎执行传输。
 
-The main input is a tensor-map descriptor. The descriptor describes the global tensor and how a tile should be read from it. It records information such as the tensor shape, strides, element size, tile shape, and swizzle mode. The issuing thread also provides the shared-memory address where the tile should land.
+主要输入是张量映射描述符。描述符描述全局张量以及应如何从中读取块。它记录张量形状、步长、元素大小、块形状和 swizzle 模式等信息。发出线程还提供块应落入的共享内存地址。
 
-After the instruction is issued, the copy runs asynchronously. The issuing thread can continue. Other threads in the CTA can also continue. The transfer is now the responsibility of the TMA engine, not a loop of ordinary load and store instructions.
+指令发出后，复制异步运行。发出线程可以继续。CTA 中的其他线程也可以继续。传输现在由 TMA 引擎负责，而不是普通加载和存储指令的循环。
 
-This gives the kernel two different ways to express the same logical operation, "copy this tile."
+这给了内核两种不同的方式来表达相同的逻辑操作"复制这个块"。
 
-One path is a thread copy. Threads cooperate to load from global memory and store into shared memory. This gives the kernel direct control over every access, but it consumes thread instructions and registers for address calculations.
+一种路径是线程复制。线程协作从全局内存加载并存入共享内存。这给了内核对每次访问的直接控制，但它消耗线程指令和寄存器用于地址计算。
 
-The other path is a TMA copy. One thread issues the transfer, and the hardware copy engine performs the rectangular copy. This is the natural path for large regular tiles, especially the operand tiles used by Tensor Core kernels.
+另一种路径是 TMA 复制。一个线程发出传输命令，硬件复制引擎执行矩形复制。这是大型规则块的自然路径，特别是张量核心内核使用的操作数块。
 
-These two paths have different synchronization rules and different performance behavior. Choosing between them is a dispatch decision. The layout tells the kernel what memory arrangement it wants. The scope tells it which threads or CTAs are participating. The dispatch decides whether the copy is implemented by ordinary thread code or by TMA.
+这两种路径有不同的同步规则和不同的性能行为。选择哪种是调度决策。布局告诉内核它想要什么内存排列。作用域告诉它哪些线程或 CTA 参与。调度决定复制是由普通线程代码实现还是由 TMA 实现。
 
-## Swizzled Layouts
+## Swizzled 布局
 
-Moving the tile is not enough. The tile also has to be placed in shared memory in a layout that the Tensor Core can read efficiently.
+仅仅搬运块是不够的。块还必须以张量核心可以高效读取的布局放置在共享内存中。
 
-This is where TMA swizzling is used. As TMA writes the tile into shared memory, it can permute the shared-memory address pattern. The global memory tile is still a logical rectangle, but the destination layout in shared memory can be swizzled.
+这就是 TMA swizzle 的用途。当 TMA 将块写入共享内存时，它可以排列共享内存地址模式。全局内存块仍然是逻辑矩形，但共享内存中的目标布局可以是 swizzled 的。
 
-The swizzle mode is part of the TMA descriptor. Once the descriptor is set up, the issuing thread does not have to manually apply the swizzle. The engine applies it as the bytes land in shared memory.
+swizzle 模式是 TMA 描述符的一部分。一旦描述符设置好，发出线程不必手动应用 swizzle。引擎在字节落入共享内存时应用它。
 
-The important requirement is agreement. The TMA descriptor, the shared-memory tile layout, and the later MMA instruction must all describe the same layout ({ref}`chap_data_layout`). If TMA writes the tile with one swizzle but the MMA reads it as if it had another, the hardware will still do exactly what it was asked to do. The bytes will simply be arranged incorrectly for the computation.
+重要的要求是一致性。TMA 描述符、共享内存块布局和后续 MMA 指令必须都描述相同的布局（{ref}`chap_data_layout`）。如果 TMA 用一种 swizzle 写入块，但 MMA 像用另一种 swizzle 那样读取它，硬件仍然会精确地执行它被要求做的事情。字节只是会为计算错误地排列。
 
-This is the point where the layout notation becomes more than a bookkeeping device. The layout used by the DSL has to match the hardware layout used by the TMA descriptor and the Tensor Core instruction. For example, if the kernel says an operand tile is stored in a 128-byte swizzled layout, the TMA descriptor has to use the matching swizzle mode, and the MMA dispatch has to expect that same shared-memory arrangement. The demo above lets you toggle between no swizzle and 128-byte swizzle; hover a source element to see where it lands once the swizzle is applied.
+这就是布局表示法不仅仅是簿记工具的地方。DSL 使用的布局必须与 TMA 描述符和张量核心指令使用的硬件布局匹配。例如，如果内核说操作数块存储在 128 字节 swizzled 布局中，TMA 描述符必须使用匹配的 swizzle 模式，MMA 调度必须期望相同的共享内存排列。上面的演示让你在无 swizzle 和 128 字节 swizzle 之间切换；悬停源元素以查看应用 swizzle 后的落点。
 
-A useful way to read the swizzle is that TMA is not changing the logical tile. It is changing where the logical elements land physically in shared memory. The later MMA still consumes the same logical A or B tile. The swizzle only decides how that tile is arranged across shared memory banks.
+理解 swizzle 的一个有用方式是 TMA 没有改变逻辑块。它改变了逻辑元素在共享内存中的物理落点。后续 MMA 仍然消耗相同的逻辑 A 或 B 块。swizzle 只决定该块如何跨共享内存 bank 排列。
 
-## 3D TMA for Tiling and Swizzling
+## 用于分块和 Swizzle 的 3D TMA
 
-A plain TMA copy moves a flat 2D tile, but the shared-memory layout the Tensor Core wants is usually *tiled* into swizzle atoms (the 8 x 128-byte atoms from {ref}`chap_data_layout`). TMA handles that with an extra descriptor dimension. A **3D TMA** describes the shared-memory box as `(group, row, col)`, where the group dimension walks across atoms and the inner two address within one atom. A single 3D copy then both lays the tile out atom by atom (tiling) and applies the swizzle inside each atom, so the data arrives already in the layout the MMA expects, with no separate tiling or swizzling pass.
+普通 TMA 复制搬运平坦的 2D 块，但张量核心想要的共享内存布局通常*分块*为 swizzle 原子（{ref}`chap_data_layout` 中的 8 × 128 字节原子）。TMA 通过额外的描述符维度处理这一点。**3D TMA** 将共享内存框描述为 `(group, row, col)`，其中 group 维度遍历原子，内两个维度在单个原子内寻址。单次 3D 复制既逐原子铺设块（分块），又在每个原子内应用 swizzle，因此数据到达时已经处于 MMA 期望的布局，无需单独的分块或 swizzle 传递。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe class="demo-tma3d" src="../demo/tma_3d.html" title="Tiling and swizzling with 3D TMA" loading="lazy"
+<iframe class="demo-tma3d" src="../demo/tma_3d.html" title="使用 3D TMA 进行分块和 swizzle" loading="lazy"
         style="width:100%; min-width:1320px; height:640px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 ```
-*Interactive: a 3D TMA copy, addressed as (group, row, col), tiling into swizzled shared memory.*
+*交互演示：3D TMA 复制，地址为 (group, row, col)，分块到 swizzled 共享内存中。*
 
-Choosing the swizzle *format* is tied to this tiling. A wider swizzle scatters a column across more banks, so 128-byte swizzle is the default when it fits, but an N-byte atom needs the tile's contiguous dimension to fill it. A tile that is small because of a shape constraint therefore cannot use 128-byte swizzle and must step down to 64-byte or 32-byte: the rule of thumb is to pick the largest swizzle the tile can fill ({ref}`chap_data_layout`). The demo below shows the constraint directly: a 128-byte swizzle on a 16 x 16 tile becomes conflict-free only once the tile is split into 16 x 8 groups that match the atom.
+选择 swizzle *格式*与此分块相关。更宽的 swizzle 将一列分散到更多 bank，因此 128 字节 swizzle 在适合时是默认选择，但 N 字节原子需要块的连续维度来填充它。由于形状约束而较小的块因此不能使用 128 字节 swizzle，必须降级到 64 字节或 32 字节：经验法则是选择块能填充的最大 swizzle（{ref}`chap_data_layout`）。下面的演示直接显示了约束：16 × 16 块上的 128 字节 swizzle 只有在块被分成匹配原子的 16 × 8 组时才变得无冲突。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe class="demo-tma3d" src="../demo/tiling_constraint.html" title="Swizzle imposes a tiling constraint" loading="lazy"
+<iframe class="demo-tma3d" src="../demo/tiling_constraint.html" title="Swizzle 施加分块约束" loading="lazy"
         style="width:100%; min-width:1320px; height:640px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 <script>
@@ -87,61 +87,61 @@ Choosing the swizzle *format* is tied to this tiling. A wider swizzle scatters a
 })();
 </script>
 ```
-*Interactive: a 128-byte swizzle on a 16 x 16 tile, conflict-free once tiled into 16 x 8 groups.*
+*交互演示：16 × 16 块上的 128 字节 swizzle，分成 16 × 8 组后变得无冲突。*
 
-## Completion: Loads
+## 完成：加载
 
-The copy is asynchronous, so issuing it is not enough. A consumer cannot read the shared-memory tile just because the TMA instruction has been issued. The tile is safe to read only after the engine has finished writing the bytes.
+复制是异步的，因此仅仅发出它还不够。消费者不能仅因 TMA 指令已发出就读取共享内存块。只有在引擎完成写入字节后，块才可安全读取。
 
-For TMA loads, the completion signal is an `mbarrier` ({ref}`chap_async_barriers`).
+对于 TMA 加载，完成信号是 `mbarrier`（{ref}`chap_async_barriers`）。
 
-The usual sequence is:
+通常的序列是：
 
-1. initialize or reuse an `mbarrier` for the pipeline stage;
-2. tell the barrier how many bytes the TMA transfer is expected to write;
-3. issue the TMA load;
-4. let the TMA engine update the barrier as bytes arrive;
-5. have the consumer wait on the barrier phase before reading the shared-memory tile.
+1. 初始化或重用流水线阶段的 `mbarrier`；
+2. 告诉屏障 TMA 传输预期写入多少字节；
+3. 发出 TMA 加载；
+4. 让 TMA 引擎在字节到达时更新屏障；
+5. 让消费者在读取共享内存块之前等待屏障阶段。
 
-The byte count is set with an operation such as:
+字节计数通过以下操作设置：
 
 ```text
 mbarrier.arrive.expect_tx(bytes)
 ```
 
-This does two jobs. It records the expected transfer size, and it also performs the issuing thread's arrival on the barrier. The barrier is not complete merely because this call happened. It still waits for the TMA engine to report that the expected bytes have arrived.
+这做两项工作。它记录预期传输大小，同时也执行发出线程对屏障的到达。屏障不会仅因此调用发生就完成。它仍然等待 TMA 引擎报告预期字节已到达。
 
-As the transfer progresses, the engine performs complete-tx updates against the barrier. The barrier phase flips only after both conditions are met: the arrival count is satisfied, and the pending byte count reaches zero.
+随着传输进行，引擎对屏障执行 complete-tx 更新。只有当两个条件都满足时屏障阶段才会翻转：到达计数满足，且待处理字节计数达到零。
 
-The consumer then waits on that barrier. Once the wait completes for the expected phase, the shared-memory tile is ready. At that point the MMA path can safely read it.
+然后消费者等待该屏障。一旦等待完成预期阶段，共享内存块就准备就绪。此时 MMA 路径可以安全地读取它。
 
-![TMA load synchronization flow](../img/tma_sync_flow.png)
+![TMA 加载同步流程](../img/tma_sync_flow.png)
 
-This is the same barrier model used by other asynchronous producer-consumer handoffs. The producer is the TMA engine. The consumer is the MMA path or any other code that reads the shared-memory tile. The barrier is the explicit handoff between them.
+这与其他异步生产者-消费者交接使用的屏障模型相同。生产者是 TMA 引擎。消费者是 MMA 路径或任何其他读取共享内存块的代码。屏障是它们之间的显式交接。
 
-## Completion: Stores
+## 完成：存储
 
-TMA stores move data in the opposite direction, from shared memory to global memory. They are also asynchronous, but the completion mechanism is different.
+TMA 存储以相反方向搬运数据，从共享内存到全局内存。它们也是异步的，但完成机制不同。
 
-A TMA load usually feeds a consumer inside the same kernel. The MMA path needs to know when the shared-memory tile is ready. That is why the load path uses an `mbarrier`.
+TMA 加载通常为同一内核内的消费者提供数据。MMA 路径需要知道共享内存块何时就绪。这就是加载路径使用 `mbarrier` 的原因。
 
-A TMA store usually writes the final data out to global memory. There is often no immediate in-kernel consumer waiting on the stored result. The main thing the kernel needs to know is when it is safe to reuse the shared-memory buffer or finish the store sequence.
+TMA 存储通常将最终数据写入全局内存。通常没有立即的内核内消费者等待存储结果。内核需要知道的主要事情是什么时候可以安全地重用共享内存缓冲区或完成存储序列。
 
-For that, TMA stores use a commit group and wait group. The kernel issues one or more stores, commits the group, and later waits for the group to drain. After the wait completes, the stores in that group have finished from the kernel's point of view, and the shared-memory region used by the store can be reused safely.
+为此，TMA 存储使用提交组和等待组。内核发出一个或多个存储，提交组，稍后等待组排空。等待完成后，从内核的角度看，该组中的存储已完成，存储使用的共享内存区域可以安全重用。
 
-So the rule is simple:
+所以规则很简单：
 
 ```text
-TMA load:  wait through an mbarrier with byte-count tracking
-TMA store: wait through a commit group and wait group
+TMA load:  通过带有字节计数跟踪的 mbarrier 等待
+TMA store: 通过提交组和等待组等待
 ```
 
-The two mechanisms serve the same purpose at different handoff points. Loads need to make a shared-memory tile visible to later consumers. Stores need to make sure an outgoing transfer is complete before the kernel reuses the source storage or relies on the store having drained.
+两种机制在不同的交接点服务于相同的目的。加载需要使共享内存块对后续消费者可见。存储需要确保出站传输完成，然后内核才能重用源存储或依赖存储已排空。
 
-## Why TMA Matters for Pipelining
+## 为什么 TMA 对流水线很重要
 
-TMA is most useful when it is part of a pipeline. A kernel can issue the load for a future tile while the Tensor Core computes the current tile. The load runs in the background. The compute runs in the foreground. The barrier connects the two when the future tile becomes the current tile.
+TMA 在作为流水线的一部分时最有用。内核可以在张量核心计算当前块时为未来块发出加载。加载在后台运行。计算在前台运行。当未来块变为当前块时，屏障连接两者。
 
-A typical GEMM loop uses this structure repeatedly. One stage of shared memory holds the tile currently consumed by MMA. Another stage is being filled by TMA. As the loop advances, the roles rotate. Before MMA reads a stage, it waits on that stage's load barrier. Before TMA overwrites a stage, the kernel makes sure the previous consumer is done with it.
+典型的 GEMM 循环重复使用这种结构。共享内存的一个阶段保存 MMA 当前消耗的块。另一个阶段正在被 TMA 填充。随着循环推进，角色轮换。在 MMA 读取一个阶段之前，它等待该阶段的加载屏障。在 TMA 覆写一个阶段之前，内核确保之前的消费者已完成使用它。
 
-This is why TMA and `mbarrier` usually appear together in Blackwell- and Hopper-style kernels. TMA gives the kernel an asynchronous copy engine. The barrier gives the kernel a precise way to know when the copied bytes are ready.
+这就是为什么 TMA 和 `mbarrier` 通常在 Blackwell 和 Hopper 风格的内核中一起出现。TMA 给内核一个异步复制引擎。屏障给内核一个精确的方式来知道复制的字节何时就绪。

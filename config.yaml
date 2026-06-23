@@ -1,0 +1,31 @@
+# modern-gpu-programming-for-mlsys 翻译项目配置
+# 由 translate-engine 自动生成，请根据实际情况修改
+
+project:
+  name: "modern-gpu-programming-for-mlsys"
+  title: "This book teaches modern GPU kernel programming as a progression: **understand the"
+  title_translated: ""  # TODO: 填写翻译标题
+  author: ""
+  license: ""
+  version: ""
+
+source:
+  type: markdown
+  upstream: "git@github.com:mlc-ai/modern-gpu-programming-for-mlsys.git"
+  branch: main
+  sync_strategy: submodule
+
+translation:
+  target_language: zh-CN
+  engine: pdflatex
+
+domains:
+  - technical
+
+terminology:
+  file: terms.yaml
+  auto_check: true
+
+build:
+  command: "pandoc -o output.pdf"
+  targets: [pdf]

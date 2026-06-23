@@ -1,89 +1,86 @@
 (chap_gemm_basics)=
-# Building a Tiled GEMM
+# 构建分块 GEMM
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- Builds a correct tiled GEMM from the TIRx tile primitives, starting from a single output tile.
-- Step 1 is a single-tile GEMM, Step 2 adds the K-loop accumulation, Step 3 tiles spatially across CTAs for full matrices.
-- Correctness comes first; performance is the job of the next two chapters.
+- 从 TIRx 块原语构建正确的分块 GEMM，从单个输出块开始。
+- 第 1 步是单块 GEMM，第 2 步添加 K 循环累加，第 3 步跨 CTA 空间分块处理完整矩阵。
+- 正确性优先；性能是后面两章的任务。
 :::
 
-GEMM is the workload this entire book is built around. It sits under the linear layers, attention projections, and convolutions that dominate a GPU's time, so the difference between a correct GEMM and a fast one is the difference between leaving most of the chip idle and saturating it.
+GEMM 是本书构建围绕的工作负载。它位于线性层、注意力投影和卷积之下，这些占据了 GPU 的大部分时间，因此正确 GEMM 和快速 GEMM 之间的差距就是让大部分芯片空闲和饱和它之间的差距。
 
-That gap is too large to cross in one jump. A saturating kernel makes you debug memory movement, accumulation, tiling, and Tensor Core scheduling all at once, with nothing trustworthy to compare against. The safer path is to start from the smallest kernel that produces a correct answer, then grow it one decision at a time.
+这个差距太大，无法一步跨越。饱和内核让你同时调试内存搬运、累加、分块和张量核心调度，没有可信赖的比较对象。更安全的路径是从产生正确答案的最小内核开始，然后每次做一个决策来增长它。
 
-This chapter writes that first correct tiled GEMM. The previous chapters introduced the TIRx scope / layout / dispatch model in the abstract; here we apply it to a real kernel. We begin with one 128 x 128 output tile and grow it into a kernel that handles full-size matrices, adding K-dimension accumulation and then spatial tiling across many CTAs.
+本章编写第一个正确的分块 GEMM。前面的章节抽象地介绍了 TIRx 作用域/布局/调度模型；这里我们将其应用于真实内核。我们从一个 128×128 输出块开始，将其增长为处理完整大小矩阵的内核，添加 K 维度累加，然后跨多个 CTA 空间分块。
 
-This is the first of three chapters that walk a single GEMM optimization path from end to end. In this one we build a correct tiled kernel and stop there. The next chapter ({ref}`chap_gemm_async`) replaces the thread copies with TMA and overlaps data movement with compute through pipelining, and {ref}`chap_gemm_advanced` goes further still with warp specialization and CTA clusters. Each chapter builds on the one before it, so the kernels accumulate features rather than start over.
+这是三章中的第一章，端到端地走完单条 GEMM 优化路径。本章我们构建一个正确的分块内核并停在那里。下一章（{ref}`chap_gemm_async`）用 TMA 替换线程复制，并通过流水线将数据搬运与计算重叠，{ref}`chap_gemm_advanced` 进一步使用 warp 特化和 CTA 集群。每章建立在前一章之上，因此内核累积特性而不是重新开始。
 
-It helps to read each step as an edit to a single contract with three terms: which **scope** runs the operation, which **layout** the operand tiles use, and which **dispatch** path executes it. Most steps have one primary change, so we open them with a small card that names that change and calls out any synchronization detail needed to make the reuse safe. Step 1 establishes the baseline that the rest of the path edits.
+将每一步视为对单个契约的编辑会有所帮助，该契约有三个项：哪个**作用域**运行操作，操作数块使用哪个**布局**，以及哪条**调度**路径执行它。大多数步骤有一个主要变化，因此我们用一个小卡片打开它们，命名该变化并指出使重用安全所需的任何同步细节。第 1 步建立路径其余部分编辑的基线。
 
 ## GEMM
 
-GEMM is the dense matrix multiply that sits underneath linear layers, attention projections, and many convolution implementations, which is why a fast GEMM kernel pays off almost everywhere you look. The examples in this tutorial use $D = A B^{\top}$:
+GEMM 是位于线性层、注意力投影和许多卷积实现之下的密集矩阵乘法，这就是为什么快速 GEMM 内核几乎在你看到的每个地方都有回报。本教程中的示例使用 $D = A B^{\top}$：
 
-- $A$ has shape $M \times K$.
-- $B$ has shape $N \times K$.
-- $D$ has shape $M \times N$.
-- $D[m,n] = \sum_k A[m,k] \cdot B[n,k]$.
+- $A$ 形状为 $M \times K$。
+- $B$ 形状为 $N \times K$。
+- $D$ 形状为 $M \times N$。
+- $D[m,n] = \sum_k A[m,k] \cdot B[n,k]$。
 
-The transpose is not an extra operation we choose to perform; it falls out of how the data is stored. The examples keep $B$ as $N$ rows of length $K$, which is the layout linear-layer weights usually come in, so contracting along $K$ naturally reads $B^{\top}$ without any rearrangement.
+转置不是我们选择执行的额外操作；它来自数据的存储方式。示例将 $B$ 保持为长度 $K$ 的 $N$ 行，这是线性层权重通常的布局，因此沿 $K$ 收缩自然读取 $B^{\top}$ 而无需任何重排。
 
-Throughout the tutorial we measure a kernel by its throughput in TFLOPS, counting the two floating-point operations per multiply-add against the wall-clock time:
+在本教程中，我们通过 TFLOPS 吞吐量来衡量内核，将每次乘加的两个浮点操作与墙钟时间计算：
 
 $$\text{TFLOPS} = \frac{2 \times M \times N \times K}{t_{\text{seconds}} \times 10^{12}}$$
 
-### GEMM Data Path
+### GEMM 数据路径
 
-Every optimization in this tutorial comes down to where the data lives and how it moves, so it is worth mapping that out before we write any code. At heart, a Blackwell GEMM kernel is organized around just two activities: moving tiles between memories, and computing on them. The figure below traces a tile through every memory it touches on its way from input to output:
+本教程中的每个优化都归结为数据存在于何处以及如何移动，因此在编写任何代码之前值得映射出来。核心上，Blackwell GEMM 内核围绕两个活动组织：在内存之间移动块，以及对它们进行计算。下图跟踪一个块从输入到输出过程中经过的每个内存：
 
-![*Memory Data Flow*](../img/memory_dataflow.png)
+![*内存数据流*](../img/memory_dataflow.png)
 
-The figure above shows the baseline path that every later optimization edits but never replaces.
-Read it from left to right: operand tiles first move from GMEM to SMEM; `tcgen05.mma` then
-consumes the SMEM operands and writes accumulators to TMEM; and finally the epilogue reads TMEM
-back into registers before storing the result to GMEM. Keep this chain in mind, because every step
-below changes *how* one of these hops happens; it never changes the hops themselves.
+上图显示了每个后续优化编辑但从不替换的基线路径。
+从左到右读：操作数块首先从 GMEM 移动到 SMEM；`tcgen05.mma` 然后消费 SMEM 操作数并将累加器写入 TMEM；最后尾声代码在将结果存储到 GMEM 之前将 TMEM 读回寄存器。记住这个链，因为下面每一步都改变其中一个跳跃的*方式*；它从不改变跳跃本身。
 
-## Optimization Path
+## 优化路径
 
-The plain data path above is enough to get a correct answer, but it leaves most of the hardware idle. The rest of the tutorial closes that gap by adding Blackwell features one at a time, each one expressed through a TIRx tile primitive. The path we will follow visits these features in turn:
+上面的简单数据路径足以获得正确答案，但它让大部分硬件空闲。本教程的其余部分通过一次添加一个 Blackwell 特性来缩小这个差距，每个特性通过 TIRx 块原语表达。我们将遵循的路径依次访问这些特性：
 
-- **TMA async movement** moves GMEM <-> SMEM tiles through Blackwell's hardware copy path, with barriers tracking completion.
-- **Software pipelining** uses multiple SMEM stages so that the data movement for the next K tile can overlap Tensor Core compute on the current one.
-- **Persistent scheduling** keeps a fixed pool of CTAs, each processing many output tiles through a tile scheduler, instead of launching one CTA per tile.
-- **Warp specialization** splits the producer, MMA consumer, and writeback roles across separate warpgroups.
-- **CTA clusters** let two CTAs cooperate on a single, larger Blackwell MMA tile.
-- **Multi-consumer execution** uses multiple consumer warpgroups to compute different parts of the tile at once, raising compute density.
+- **TMA 异步搬运**通过 Blackwell 的硬件复制路径移动 GMEM <-> SMEM 块，屏障跟踪完成。
+- **软件流水线**使用多个 SMEM 阶段，使下一个 K 块的数据搬运可以与当前块的张量核心计算重叠。
+- **持久调度**保持固定数量的 CTA 池，每个通过块调度器处理多个输出块，而不是为每个块启动一个 CTA。
+- **Warp 特化**将生产者、MMA 消费者和写回角色分配到不同的 warpgroup。
+- **CTA 集群**让两个 CTA 协作处理单个更大的 Blackwell MMA 块。
+- **多消费者执行**使用多个消费者 warpgroup 同时计算块的不同部分，提高计算密度。
 
 ---
 
 (chap_single_tile)=
-## Step 1: Sequential Single-Tile GEMM
+## 第 1 步：顺序单块 GEMM
 
-The simplest GEMM that still exercises the full hardware path is one that computes a single output tile. So that is where we begin. Step 1 computes one 128 x 128 output tile with K = 64, small enough that nothing has to loop, and every piece of the data path appears exactly once. With nothing repeated, we can see each hop in isolation before we ever have to reason about a loop.
+仍然使用完整硬件路径的最简单 GEMM 是计算单个输出块的那个。所以这是我们开始的地方。第 1 步计算一个 K = 64 的 128×128 输出块，足够小以至于不需要循环，数据路径的每个部分恰好出现一次。没有重复，我们可以在必须推理循环之前单独查看每个跳跃。
 
-> **What this step establishes: the baseline**
-> - Scope: a single warpgroup of 128 threads walks the whole path in order, one stage after another.
-> - Layout: the A and B tiles live in SMEM, the accumulator in TMEM, and the result is staged out through registers.
-> - Dispatch: synchronous `Tx.copy` carries the loads, and `tcgen05` runs the MMA.
+> **这一步建立的：基线**
+> - 作用域：单个 warpgroup 的 128 个线程按顺序走完整个路径，一个阶段接一个阶段。
+> - 布局：A 和 B 块存在于 SMEM 中，累加器在 TMEM 中，结果通过寄存器暂存输出。
+> - 调度：同步 `Tx.copy` 执行加载，`tcgen05` 运行 MMA。
 
-### Single-Tile Dataflow
+### 单块数据流
 
-With the baseline contract fixed, the next thing to pin down is the order in which one tile travels through it. This first kernel walks the core GEMM data path exactly once, the same GMEM -> SMEM -> TMEM -> registers -> GMEM chain from the data-flow figure, with no loop wrapped around it. It allocates its working memory, loads the operands, computes the product, writes the result back, and cleans up after itself:
+基线契约确定后，下一件要确定的事情是一个块通过它的顺序。这个第一个内核恰好走一次核心 GEMM 数据路径，与数据流图中相同的 GMEM -> SMEM -> TMEM -> 寄存器 -> GMEM 链，没有循环包裹它。它分配工作内存，加载操作数，计算乘积，写回结果，然后清理自己：
 
-1. **Allocate**: SMEM (pool allocator), TMEM (`tcgen05.alloc`), mbarrier
-2. **Load**: All 128 threads cooperatively copy A and B tiles from GMEM to SMEM (sync `Tx.copy`)
-3. **Compute**: Single elected thread issues `Tx.gemm_async` + `tcgen05.commit`; all threads wait on mbarrier
-4. **Writeback**: Warpgroup reads TMEM → registers; each thread casts fp32→fp16 and writes to GMEM
-5. **Deallocate**: TMEM deallocation
+1. **分配**：SMEM（池分配器）、TMEM（`tcgen05.alloc`）、mbarrier
+2. **加载**：所有 128 个线程协作将 A 和 B 块从 GMEM 复制到 SMEM（同步 `Tx.copy`）
+3. **计算**：单个选举线程发出 `Tx.gemm_async` + `tcgen05.commit`；所有线程等待 mbarrier
+4. **写回**：Warpgroup 读取 TMEM → 寄存器；每个线程将 fp32 转换为 fp16 并写入 GMEM
+5. **释放**：TMEM 释放
 
-### Four Pieces of the First Kernel
+### 第一个内核的四个部分
 
-The full kernel is only a few dozen lines, but it is easier to digest in parts. We will read it in four pieces (memory allocation, the synchronous load, the MMA dispatch, and the writeback) and assemble them into one kernel only afterward. The API names that appear along the way are the TIRx tile-primitive vocabulary introduced in Part II ({ref}`chap_tirx_primer`, {ref}`chap_tirx_layout_api`).
+完整内核只有几十行，但分部分更容易理解。我们将分四部分阅读它（内存分配、同步加载、MMA 调度和写回），然后将它们组装成一个内核。沿途出现的 API 名称是第二部分（{ref}`chap_tirx_primer`、{ref}`chap_tirx_layout_api`）介绍的 TIRx 块原语词汇。
 
-**Memory allocation.** The kernel begins by carving out shared memory for the operands, along with a slot for the TMEM address and an mbarrier:
+**内存分配。** 内核首先为操作数分配共享内存，以及 TMEM 地址和 mbarrier 的槽位：
 
 ```python
 pool = T.SMEMPool()
@@ -95,9 +92,9 @@ Bsmem = pool.alloc((BLK_N, BLK_K), b_type, layout=B_layout)  # 128×64 fp16
 pool.commit()
 ```
 
-Two details here are worth pausing on. The `pool.move_base_to(1024)` pushes Asmem and Bsmem out to offset 1024, reserving the low addresses for the small pieces of metadata above them so that the bulky operand tiles land on a clean boundary. And `layout=A_layout` asks `tma_shared_layout` for a swizzled SMEM placement that both TMA and `tcgen05.mma` can read directly, exactly the kind of layout-as-contract obligation Part II described.
+两个细节值得停下来关注。`pool.move_base_to(1024)` 将 Asmem 和 Bsmem 推到偏移 1024，为上面的小元数据保留低地址，使大型操作数块落在干净的边界上。`layout=A_layout` 向 `tma_shared_layout` 请求 TMA 和 `tcgen05.mma` 都能直接读取的 swizzled SMEM 放置，正是第二部分描述的布局即契约义务。
 
-**Synchronous load.** With the buffers in place, the operands still have to reach SMEM. In this first version we let the CTA's own threads do the copying:
+**同步加载。** 缓冲区就位后，操作数仍然需要到达 SMEM。在这个第一个版本中，我们让 CTA 自己的线程执行复制：
 
 ```python
 Tx.cta.copy(Asmem[:, :], A[:, :])
@@ -105,9 +102,9 @@ Tx.cta.copy(Bsmem[:, :], B[:, :])
 T.cuda.cta_sync()
 ```
 
-Because there is only one tile here (M=N=128, K=64), copying the whole of A and B is the entire load. `Tx.cta.copy(...)` makes the CTA cooperate on that copy, with each thread responsible for its own slice of the data. The `T.cuda.cta_sync()` that follows does double duty: it waits for every thread to finish and it publishes their shared-memory writes, so that when the MMA later reads `Asmem` and `Bsmem` it sees complete tiles rather than a half-filled buffer. This thread-driven copy is also the very first thing we will replace; the next chapter ({ref}`chap_gemm_async`) swaps it out for TMA.
+因为这里只有一个块（M=N=128, K=64），复制整个 A 和 B 就是完整的加载。`Tx.cta.copy(...)` 让 CTA 协作执行该复制，每个线程负责自己的数据切片。随后的 `T.cuda.cta_sync()` 承担双重职责：它等待每个线程完成并发布它们的共享内存写入，这样当 MMA 稍后读取 `Asmem` 和 `Bsmem` 时，它看到完整的块而不是半填充的缓冲区。这个线程驱动的复制也是我们将替换的第一件事；下一章（{ref}`chap_gemm_async`）将其换成 TMA。
 
-**MMA dispatch.** With the operands now sitting in SMEM, we can issue the MMA, and we do so from a single elected thread:
+**MMA 调度。** 操作数现在位于 SMEM 中，我们可以发出 MMA，我们从单个选举线程执行：
 
 ```python
 if warp_id == 0:
@@ -117,7 +114,7 @@ if warp_id == 0:
         T.ptx.tcgen05.commit(mma_bar.ptr_to([0]), cta_group=1)
 ```
 
-The two nested guards narrow the issuer down in two steps. The outer `if warp_id == 0` keeps only warp 0 of the warpgroup, and the inner `if T.ptx.elect_sync():` then elects a single active lane within that warp. Together they leave exactly one thread to run `Tx.gemm_async` and `tcgen05.commit`.
+两个嵌套守卫分两步缩小发出者。外层 `if warp_id == 0` 只保留 warpgroup 的 warp 0，内层 `if T.ptx.elect_sync():` 然后在该 warp 中选举一个活跃 lane。它们一起恰好留下一个线程来运行 `Tx.gemm_async` 和 `tcgen05.commit`。
 
 It is worth being clear about what that single thread does and does not mean, because the natural reading is misleading. A single issuing thread does *not* imply a single-threaded multiply. The computation is still a full tile-level MMA: the hardware performs the cooperative multiply for the tile described by the SMEM operand layouts and the TMEM accumulator layout. The key is that `Tx.gemm_async` is one *tile operation*, not one hardware instruction. The K = 64 tile is wider than the hardware MMA K-atom (`MMA_K = 16`), so this one tile op lowers to a short sequence of raw `tcgen05.mma` instructions stepped along K, and the warpgroup drives each of them cooperatively. The reason only one thread issues the tile op is that each underlying `tcgen05.mma` is itself a *single-instruction* cooperative op: one launch drives that K-atom of the tile MMA. If all 128 threads issued the sequence, the same work would simply be launched 128 times over. Finally, the `accum=False` flag tells the MMA to overwrite the TMEM destination rather than add into it, which is what we want here, since there is no prior partial sum to extend.
 

@@ -1,74 +1,56 @@
-# Modern GPU Programming For MLSys
+# 面向机器学习系统的现代 GPU 编程
 
-This book teaches modern GPU kernel programming as a progression: **understand the
-GPU hardware → learn to program it → write state-of-the-art kernels.** It treats
-the Blackwell-class GPU — its memory hierarchy and Tensor Memory, its tensor-core and
-asynchronous data-movement engines, warpgroups and clusters — as the real subject. The
-vehicle is **TIRx** (Tensor IR neXt), a Python DSL for writing GPU kernels at the IR level.
+本书以递进方式教授现代 GPU 内核编程：**理解 GPU 硬件 → 学习编程方法 → 编写最先进的内核。** 它以 Blackwell 架构 GPU 为主题——涵盖其内存层次结构和张量内存、张量核心和异步数据搬运引擎、warp 组和集群。教学载体是 **TIRx**（Tensor IR neXt），一个在 IR 层面编写 GPU 内核的 Python DSL。
 
-📖 **Read it online: <https://mlc.ai/modern-gpu-programming-for-mlsys/>**
+📖 **在线阅读：<https://mlc.ai/modern-gpu-programming-for-mlsys/>**
 
-## What's inside
+## 内容概览
 
-- **Part I — Understanding the GPU.** Execution and memory model, the performance model
-  (roofline, overlap), a deep dive into data layout, the memory and compute engines (TMA,
-  Tensor Memory, Tensor Cores), asynchronous coordination, and advanced scheduling (CLC).
-- **Part II — Programming a GPU with TIRx.** An introduction to TIRx through one runnable
-  single-MMA GEMM — scope, layout, and dispatch, and how compilation works — plus the tensor
-  layout model (`TileLayout`, named axes, swizzle).
-- **Part III — GEMM: Tiled to SOTA.** A tiled GEMM built up through TMA pipelining,
-  persistent scheduling, warp specialization, and 2-CTA clusters.
-- **Part IV — Flash Attention 4.** A complete attention kernel built from the Part III techniques:
-  two MMAs with softmax between them, online-softmax rescaling, causal masking, and GQA.
-- **Reference.** TIRx language reference and compiler internals.
+- **第一部分——理解 GPU。** 执行模型和内存模型、性能模型（屋顶线、重叠）、数据布局深入讲解、内存和计算引擎（TMA、张量内存、张量核心）、异步协调，以及高级调度（CLC）。
+- **第二部分——使用 TIRx 编程 GPU。** 通过一个可运行的单 MMA GEMM 介绍 TIRx——作用域、布局和调度，以及编译原理——还包括张量布局模型（`TileLayout`、命名轴、swizzle）。
+- **第三部分——GEMM：从分块到 SOTA。** 通过 TMA 流水线、持久调度、warp 特化和 2-CTA 集群逐步构建分块 GEMM。
+- **第四部分——Flash Attention 4。** 基于第三部分技术构建的完整注意力内核：两个 MMA 之间夹 softmax、在线 softmax 重缩放、因果掩码和 GQA。
+- **参考。** TIRx 语言参考和编译器内部实现。
 
-## Build the book locally
+## 本地构建
 
-The book is a [Sphinx](https://www.sphinx-doc.org/) site (Markdown/MyST + reStructuredText):
+本书是一个 [Sphinx](https://www.sphinx-doc.org/) 站点（Markdown/MyST + reStructuredText）：
 
 ```bash
 pip install -r requirements-docs.txt
 sphinx-build -b html . _build/html
 ```
 
-### Preview
+### 预览
 
 ```bash
 python -m http.server -d _build/html 8000
 ```
 
-Open <http://localhost:8000>. On a remote machine the server runs there, so forward the
-port — `ssh -L 8000:localhost:8000 user@your-server` — then open the URL locally. (VS Code
-Remote SSH auto-forwards it.)
+打开 <http://localhost:8000>。如果在远程机器上运行，需要端口转发——`ssh -L 8000:localhost:8000 user@your-server`——然后在本地打开 URL。（VS Code Remote SSH 会自动转发。）
 
-## Running the kernels (requires a Blackwell GPU)
+## 运行内核（需要 Blackwell GPU）
 
-The kernels in this book target Blackwell (`sm_100a`), so running them needs a Blackwell GPU
-(such as a B200), the TIRx compiler, and a CUDA build of PyTorch.
+本书中的内核针对 Blackwell（`sm_100a`）架构，因此运行它们需要 Blackwell GPU（如 B200）、TIRx 编译器和 CUDA 版本的 PyTorch。
 
-**1. Install the TIRx compiler.** It ships as the `tvm.tirx` module of the Apache TVM wheel:
+**1. 安装 TIRx 编译器。** 它作为 Apache TVM wheel 的 `tvm.tirx` 模块发布：
 
 ```bash
 pip install apache-tvm==0.25.0
 ```
 
-Verify:
+验证安装：
 
 ```bash
 python -c "import tvm, tvm.tirx; print(tvm.__version__)"
 ```
 
-**2. Install PyTorch** with a CUDA build matching your GPU (used for the example inputs and the
-reference checks) — see <https://pytorch.org>.
+**2. 安装 PyTorch**（使用与 GPU 匹配的 CUDA 构建版本，用于示例输入和参考检查）——参见 <https://pytorch.org>。
 
-**3. (Optional) the reference kernels.** The full GEMM and Flash Attention 4 kernels live in the
-companion `tirx-kernels` package (`pip install -e .` from a checkout); run them with, e.g.,
-`python -m tirx_kernels.test --kernel fp16_bf16_gemm`.
+**3.（可选）参考内核。** 完整的 GEMM 和 Flash Attention 4 内核位于配套的 `tirx-kernels` 包中（从检出目录运行 `pip install -e .`）；运行示例：`python -m tirx_kernels.test --kernel fp16_bf16_gemm`。
 
-TIRx parses kernel source via Python source inspection, so examples should live in a file
-or notebook cell rather than inside `python -c`.
+TIRx 通过 Python 源码检查来解析内核源代码，因此示例应放在文件或 notebook 单元格中，而不是 `python -c` 命令中。
 
-## Deployment
+## 部署
 
-Every push to `main` is built and published automatically by GitHub Actions
-(`.github/workflows/build_deploy.yaml`) to <https://mlc.ai/modern-gpu-programming-for-mlsys/>.
+每次推送到 `main` 分支都会由 GitHub Actions（`.github/workflows/build_deploy.yaml`）自动构建并发布到 <https://mlc.ai/modern-gpu-programming-for-mlsys/>。

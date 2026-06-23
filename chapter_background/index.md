@@ -1,200 +1,110 @@
 (chap_background)=
-# GPU Execution Model
+# GPU 执行模型
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- A kernel runs over a thread hierarchy (thread → warp → warpgroup → CTA → cluster → grid) across distinct memory spaces (registers, SMEM, GMEM, TMEM).
-- Compute splits into CUDA cores and Tensor Cores; dedicated engines like TMA move the data that feeds them.
-- A kernel is a pipeline that stages data through these memory spaces and hands work between independent compute and data-movement engines; the recurring goal is to keep those engines busy at once.
+- 内核在线程层次结构（线程 → warp → warpgroup → CTA → 集群 → 网格）上运行，跨越不同的内存空间（寄存器、SMEM、GMEM、TMEM）。
+- 计算分为 CUDA 核心和张量核心；TMA 等专用引擎搬运为它们提供数据的数据。
+- 内核是一个流水线，通过这些内存空间暂存数据，并在独立的计算和数据搬运引擎之间交接工作；反复出现的目标是让这些引擎同时保持忙碌。
 :::
 
-To write fast GPU programs, it is important to understand the hardware
-itself and how code runs on that hardware. This chapter gives an overview of the GPU execution
-model: the thread hierarchy that executes the work, the memory spaces that hold and move the data,
-and the compute and data-movement engines that do the heavy lifting. We first introduce these
-pieces one by one, then put them together in a GEMM pipeline so it is clear how data and execution
-flow through the hardware. Nearly every optimization later in the book is some way of arranging
-work across those same pieces.
+要编写快速的 GPU 程序，理解硬件本身以及代码如何在该硬件上运行非常重要。本章概述 GPU 执行模型：执行工作的线程层次结构、保存和移动数据的内存空间，以及执行繁重工作的计算和数据搬运引擎。我们首先逐一介绍这些组件，然后将它们组合到 GEMM 流水线中，以清楚地展示数据和执行如何流经硬件。本书后面的几乎所有优化都是以某种方式在这些相同组件之间安排工作。
 
-Modern GPUs also contain many specialized hardware units. To give a first taste, the interactive
-demo below shows the main elements inside a Blackwell streaming multiprocessor before we zoom in on each
-part. You can click into each part to see its details.
+现代 GPU 还包含许多专用硬件单元。为了先给一个初步印象，下面的交互演示在我们深入每个部分之前，展示了 Blackwell 流式多处理器内部的主要元素。你可以点击每个部分查看其详细信息。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe src="../demo/sm_architecture.html" title="Blackwell SM architecture" loading="lazy"
+<iframe src="../demo/sm_architecture.html" title="Blackwell SM 架构" loading="lazy"
         style="width:100%; min-width:1320px; height:680px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 ```
-*Interactive: the Blackwell SM, showing its warps/warpgroups, shared memory, Tensor Memory, and the
-Tensor Core and TMA engines.*
+*交互演示：Blackwell SM，显示其 warp/warpgroup、共享内存、张量内存，以及张量核心和 TMA 引擎。*
 
-## The Execution Hierarchy
+## 执行层次结构
 
-We begin with the threads that do the work. A GPU does not present its thousands of threads as one
-flat pool. Instead it groups them into a nested hierarchy, and it does so because cooperation happens
-at several different scales at once. Each level exists to make cooperation cheap at one of those
-scales. The following figure shows the hierarchy on Blackwell; you can click into each level to
-highlight it.
+我们从执行工作的线程开始。GPU 不会将其数千个线程作为一个平坦的池呈现。相反，它将它们分组为嵌套层次结构，这样做是因为协作同时发生在几个不同的尺度上。每一层的存在都是为了使其中一个尺度上的协作变得廉价。下图显示了 Blackwell 上的层次结构；你可以点击每一层来高亮它。
 
 ```{raw} html
-<iframe src="../demo/thread_hierarchy.html" title="Blackwell thread hierarchy" loading="lazy"
+<iframe src="../demo/thread_hierarchy.html" title="Blackwell 线程层次结构" loading="lazy"
         style="width:100%; min-width:900px; height:520px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 ```
-*Interactive: click a level: thread → warp → warpgroup → CTA → cluster → grid.*
+*交互演示：点击层级：线程 → warp → warpgroup → CTA → 集群 → 网格。*
 
-- **Thread**: the scalar unit of execution. Each thread has its own program counter and its own
-  registers, and it is identified by a lane ID within its warp.
-- **Warp**: 32 threads that execute in SIMT (*single instruction, multiple threads*). The lanes of
-  a warp issue the same instruction together, yet each keeps its own registers and can be masked off
-  on its own, which is what lets the lanes of a single warp follow different branches.
-- **Warpgroup**: four consecutive warps, or 128 threads. Hopper introduced the warpgroup as the
-  unit that issues warpgroup-level MMA (`wgmma`), and on Blackwell it takes on a second role: it is
-  the cooperation unit for Tensor Memory access, where the 128 threads together move a TMEM tile into
-  or out of registers.
-- **CTA** (*Cooperative Thread Array*, what CUDA also calls a thread block): the basic unit the
-  hardware schedules. A CTA runs on a single SM and owns a private shared-memory allocation inside
-  it. Several CTAs can be resident on the same SM at once, and when they are, they divide up that
-  SM's shared-memory capacity between them.
-- **Cluster**: a group of cooperating CTAs that may live on different SMs. The CTAs in a cluster
-  can synchronize with one another and can read and write each other's shared memory, a capability
-  known as distributed shared memory.
+- **线程**：标量执行单元。每个线程有自己的程序计数器和自己的寄存器，通过其 warp 内的 lane ID 标识。
+- **Warp**：32 个线程以 SIMT（*单指令多线程*）方式执行。warp 的 lane 一起发出相同指令，但每个 lane 保持自己的寄存器并可以单独屏蔽，这使单个 warp 的 lane 可以遵循不同分支。
+- **Warpgroup**：四个连续的 warp，即 128 个线程。Hopper 引入 warpgroup 作为发出 warpgroup 级 MMA（`wgmma`）的单元，在 Blackwell 上它承担第二个角色：它是张量内存访问的协作单元，128 个线程一起将 TMEM 块移入或移出寄存器。
+- **CTA**（*协作线程数组*，CUDA 也称为线程块）：硬件调度的基本单元。CTA 在单个 SM 上运行，并在其内部拥有私有的共享内存分配。多个 CTA 可以同时驻留在同一 SM 上，当它们这样做时，它们在它们之间分配该 SM 的共享内存容量。
+- **集群**：一组协作的 CTA，可以位于不同的 SM 上。集群中的 CTA 可以相互同步，可以读写彼此的共享内存，这种能力称为分布式共享内存。
 
-These levels are worth dwelling on because, unlike on earlier architectures, Blackwell's key
-operations are **not all issued by the same group of threads**. A TMA copy is launched by a single
-thread and then carried out by hardware. A TMEM-to-register load is warpgroup-distributed: the four
-warps cooperate, each moving its own slice of the TMEM tile. A `tcgen05` MMA is committed by one
-elected thread, while a clustered MMA spans two CTAs at once. Each operation thus has its own natural granularity, and the set of threads that runs it is
-what we call the operation's **scope**, the first of the three recurring design elements (scope, layout, and
-dispatch) that this book returns to again and again.
+这些层级值得深入研究，因为与早期架构不同，Blackwell 的关键操作**并非都由同一线程组发出**。TMA 复制由单个线程启动，然后由硬件执行。TMEM 到寄存器的加载是 warpgroup 分布式的：四个 warp 协作，每个移动其自己的 TMEM 块切片。`tcgen05` MMA 由一个选举线程提交，而集群 MMA 跨两个 CTA。因此每个操作都有自己的自然粒度，运行它的线程集就是我们所说的该操作的**作用域**，这是本书反复回归的三个设计要素（作用域、布局和调度）中的第一个。
 
-## Memory Spaces
+## 内存空间
 
-The threads in that hierarchy are only as fast as the data reaching them, so we turn next to where
-that data lives. There is no single memory that is at once large and fast; physics forces a trade-off
-between capacity and speed. A GPU therefore offers several memories rather than one, each striking that
-trade-off at a different point, and a kernel works by moving data through them. Each space has its
-own capacity, its own latency, and its own rules for who may access it.
+该层次结构中的线程只有在数据到达它们时才快，因此我们接下来转向数据存在于何处。没有一种内存同时具有大容量和高速度；物理学强制在容量和速度之间做出权衡。因此 GPU 提供多种内存而不是一种，每种都在不同的点上做出这种权衡，内核通过在它们之间移动数据来工作。每个空间有自己的容量、自己的延迟，以及谁可以访问它的自己的规则。
 
-| Memory | Ownership | Role | Notes |
-|--------|-----------|------|-------|
-| **Global (GMEM)** | Device-wide | Persistent tensor storage | Large HBM, shared by all SMs |
-| **Shared (SMEM)** | Per-CTA (one SM) | Tile staging | Low-latency scratchpad; up to 228 KB/SM on B200 |
-| **Tensor Memory (TMEM)** | Per-CTA | MMA accumulator storage | New on Blackwell; used by `tcgen05` |
-| **Register File (RF)** | Per-thread | Scalars and per-thread tile fragments | Fast; holds epilogue/temp values |
+| 内存 | 拥有者 | 角色 | 备注 |
+|------|--------|------|------|
+| **全局内存 (GMEM)** | 设备级 | 持久张量存储 | 大容量 HBM，所有 SM 共享 |
+| **共享内存 (SMEM)** | 每 CTA（一个 SM） | 块暂存 | 低延迟暂存器；B200 上最多 228 KB/SM |
+| **张量内存 (TMEM)** | 按 CTA | MMA 累加器存储 | Blackwell 新增；由 `tcgen05` 使用 |
+| **寄存器文件 (RF)** | 每线程 | 标量和每线程块片段 | 快速；保存尾声/临时值 |
 
-Read in order, these spaces describe a path. The data path of almost every kernel in this book is
-**GMEM → SMEM → (compute) → registers → SMEM → GMEM**, and for tensor-core kernels TMEM sits in the
-middle of that path, holding the accumulators while the math runs.
+按顺序读取，这些空间描述了一条路径。本书中几乎每个内核的数据路径是 **GMEM → SMEM →（计算）→ 寄存器 → SMEM → GMEM**，对于张量核心内核，TMEM 位于该路径的中间，在数学运算运行时保存累加器。
 
-Of the four, **Tensor Memory (TMEM)** is the only one with no analog on pre-Blackwell hardware, and
-its full details wait until {ref}`chap_tensor_cores`. The motivation for it is worth understanding
-now, though. Earlier GPUs kept large MMA accumulators in registers, where they competed for a scarce
-resource. Blackwell instead writes `tcgen05` accumulator output to TMEM, a CTA-scoped 2D scratchpad
-of 128 lanes by up to 512 32-bit columns per CTA (the array physically lives on the SM). The kernel
-then has to read TMEM back into registers explicitly before the epilogue. That extra step is not
-free, and two of its consequences will recur throughout the book. The first is that TMEM reads are
-**explicit and warpgroup-distributed**, carried out cooperatively by the four warps of a warpgroup.
-The second is that TMEM, unlike registers, must be **explicitly allocated and freed**.
+在四者中，**张量内存 (TMEM)** 是唯一在 Blackwell 之前硬件上没有类似物的，其完整细节留到 {ref}`chap_tensor_cores`。但现在值得理解其动机。早期 GPU 将大型 MMA 累加器保存在寄存器中，它们在那里争夺稀缺资源。Blackwell  instead 将 `tcgen05` 累加器输出写入 TMEM，这是一个 CTA 作用域的 2D 暂存器，每个 CTA 128 个 lane 乘最多 512 个 32 位列（数组物理上位于 SM 上）。然后内核必须在尾声代码之前显式地将 TMEM 读回寄存器。这个额外步骤不是免费的，其两个后果将在全书中反复出现。第一个是 TMEM 读取是**显式且 warpgroup 分布式的**，由 warpgroup 的四个 warp 协作执行。第二个是 TMEM 不像寄存器，必须**显式分配和释放**。
 
-### Distributed Shared Memory Across a Cluster
+### 跨集群的分布式共享内存
 
-The cluster is the one level of the hierarchy whose members can span several SMs, and that reach buys
-a memory capability the other levels lack. A CTA runs on one SM and works out of that SM's shared
-memory, but a single CTA's SMEM budget is finite, and large tiles often demand more operand storage,
-or more reuse, than one block alone can supply. Hopper's answer was the **thread block cluster**: a
-group of CTAs that cooperate more tightly than independent blocks do, in that they can synchronize
-together and read and write each other's shared memory, a capability called **distributed shared
-memory (DSMEM)**. Blackwell keeps clusters and adds to them, with dynamic scheduling
-({ref}`chap_clc`) and 2-CTA cooperative MMA.
+集群是层次结构中唯一一个成员可以跨越多个 SM 的层级，这种覆盖范围赋予了其他层级缺乏的内存能力。CTA 在一个 SM 上运行并使用该 SM 的共享内存工作，但单个 CTA 的 SMEM 预算是有限的，大型块通常需要比单个块能提供的更多的操作数存储或更多重用。Hopper 的答案是**线程块集群**：一组比独立块更紧密协作的 CTA，它们可以一起同步并读写彼此的共享内存，这种能力称为**分布式共享内存 (DSMEM)**。Blackwell 保留集群并添加了动态调度（{ref}`chap_clc`）和 2-CTA 协作 MMA。
 
-DSMEM lets a CTA address and access a peer CTA's shared memory directly. A thread can name a location
-in a peer's SMEM and bulk-copy a tile straight from its own SMEM into the peer's, raising a completion
-barrier ({ref}`chap_async_barriers`) once the bytes have landed. The 2-CTA cluster GEMM in Part III is
-built on exactly this mechanism, using it to share operand tiles across the pair of CTAs without ever
-routing them back through global memory.
+DSMEM 允许 CTA 直接寻址和访问对等 CTA 的共享内存。线程可以命名对等体 SMEM 中的位置，并批量将块直接从自己的 SMEM 复制到对等体的 SMEM 中，在字节落地后发出完成屏障（{ref}`chap_async_barriers`）。第三部分的 2-CTA 集群 GEMM 正是建立在这种机制之上，使用它在两个 CTA 之间共享操作数块，而无需通过全局内存路由。
 
-The figure below shows the extra DSMEM hop that a CTA cluster makes possible; click a piece to see
-what each CTA owns and where the cross-CTA read happens.
+下图显示了 CTA 集群使能的额外 DSMEM 跳跃；点击一块以查看每个 CTA 拥有什么以及跨 CTA 读取发生在哪里。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe src="../demo/cta_cluster.html" title="A 2-CTA cluster sharing distributed shared memory" loading="lazy"
+<iframe src="../demo/cta_cluster.html" title="共享分布式共享内存的 2-CTA 集群" loading="lazy"
         style="width:100%; min-width:720px; height:580px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 ```
-*Interactive: a 2-CTA cluster, where each CTA owns half of A and half of B, reads the other's B across the
-cluster (DSMEM), and the pair produces a 256×256 output tile.*
+*交互演示：2-CTA 集群，每个 CTA 拥有 A 的一半和 B 的一半，跨集群读取对方的 B（DSMEM），该对产生 256×256 输出块。*
 
-## Compute: CUDA Cores and Tensor Cores
+## 计算：CUDA 核心和张量核心
 
-The threads and the data they move have to meet at an arithmetic unit, and an SM offers two distinct
-kinds of math engine rather than one. The division of labor between the two shapes how nearly every
-kernel is written, and they play complementary roles.
+线程和它们移动的数据必须在算术单元相遇，SM 提供两种不同的数学引擎而不是一种。两者之间的分工塑造了几乎每个内核的编写方式，它们扮演互补的角色。
 
-- **CUDA cores** are general-purpose SIMT ALUs. They run the scalar and vector instructions that
-  handle index arithmetic, elementwise math, reductions, and control flow, the glue logic that
-  surrounds the heavy matrix work.
-- **Tensor Cores** are fixed-function units that perform a dense matrix multiply-accumulate at *tile*
-  granularity, computing $D = AB + C$ in a single instruction.
+- **CUDA 核心**是通用 SIMT ALU。它们运行处理索引计算、逐元素数学、归约和控制流的标量和向量指令，这些是围绕大型矩阵工作的粘合逻辑。
+- **张量核心**是执行密集矩阵乘加的专用功能单元，以*块*粒度计算 $D = AB + C$。
 
-The reason this split matters is that the Tensor Cores deliver vastly more arithmetic throughput than
-the CUDA cores, on the order of 10× or more in FLOP/s, so dense linear algebra (GEMM, convolution,
-and attention) reaches peak performance only when it runs on the Tensor Cores. Getting performance is
-therefore largely a matter of keeping those Tensor Cores fed. What shifts from one GPU generation to the next is *how* the Tensor Cores are
-programmed and *where* their results come to rest. Hopper introduced the asynchronous warpgroup MMA
-(`wgmma.mma_async`); Blackwell's fifth-generation Tensor Core, `tcgen05`, places its accumulators in
-Tensor Memory instead of registers, and we devote {ref}`chap_tensor_cores` to it.
+这种分工重要的原因是张量核心提供比 CUDA 核心多得多的算术吞吐量，大约 10 倍或更多 FLOP/s，因此密集线性代数（GEMM、卷积和注意力）只有在张量核心上运行时才能达到峰值性能。因此获得性能在很大程度上是保持这些张量核心供给充足的问题。从一代 GPU 到下一代变化的是*如何*编程张量核心以及它们的结果*在哪里*停留。Hopper 引入了异步 warpgroup MMA（`wgmma.mma_async`）；Blackwell 第五代张量核心 `tcgen05` 将其累加器放在张量内存中而不是寄存器中，我们用 {ref}`chap_tensor_cores` 专门介绍它。
 
-Clusters extend these engines in two ways that recur throughout the GEMM chapters. **2-CTA cooperative
-MMA** lets two CTAs each contribute their SMEM operands to a single, larger Tensor Core MMA tile.
-**TMA multicast** lets one load by the data-movement engine deliver the same GMEM tile to several CTAs
-at once, eliminating the redundant global traffic that separate loads would otherwise incur. Both
-build on the distributed shared memory introduced earlier.
+集群以两种方式扩展这些引擎，这两种方式在 GEMM 章节中反复出现。**2-CTA 协作 MMA** 让两个 CTA 各自贡献其 SMEM 操作数到单个更大的张量核心 MMA 块中。**TMA 多播**让数据搬运引擎的一次加载将相同的 GMEM 块同时传递给多个 CTA，消除否则单独加载会产生的冗余全局流量。两者都建立在前面介绍的分布式共享内存之上。
 
-## The GEMM Data Pipeline
+## GEMM 数据流水线
 
-So far we have introduced the hardware units individually. To see how they work together, we can
-use a typical general-purpose matrix multiplication (GEMM) pipeline as an example. The
-interactive demo below shows the units involved in a three-stage GEMM tile pipeline; click an action
-such as `tma load` to highlight the data path it takes across the hardware units.
+到目前为止，我们已经单独介绍了硬件单元。为了了解它们如何协同工作，我们可以使用典型的通用矩阵乘法（GEMM）流水线作为示例。下面的交互演示显示了三阶段 GEMM 块流水线中涉及的单元；点击 `tma load` 等操作以高亮其跨硬件单元的数据路径。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe src="../demo/pipeline_arch.html" title="Blackwell GEMM data pipeline" loading="lazy"
+<iframe src="../demo/pipeline_arch.html" title="Blackwell GEMM 数据流水线" loading="lazy"
         style="width:100%; min-width:1320px; height:680px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 ```
-*Interactive: the load → MMA → epilogue pipeline on Blackwell; click an action to trace its data path across the hardware units.*
+*交互演示：Blackwell 上的加载 → MMA → 尾声流水线；点击操作以跟踪其跨硬件单元的数据路径。*
 
-A single GEMM tile flows through three stages.
+单个 GEMM 块流经三个阶段。
 
-1. **Load.** A TMA copy ({ref}`chap_tma`) streams an A or B operand tile from GMEM into SMEM. One
-   thread issues the copy, recording up front how many bytes are expected to arrive. As the bytes
-   land, the TMA engine reports their progress, and a completion barrier flips only once all the
-   expected bytes have been delivered.
-2. **Compute.** A `tcgen05` MMA ({ref}`chap_tensor_cores`) reads the operand tiles out of SMEM and
-   accumulates the product into a TMEM tile. One elected thread issues it, and it signals a barrier
-   when the math is done.
-3. **Epilogue.** The warpgroup reads the TMEM accumulator back into registers, casts the result to
-   the output dtype, and stores it to GMEM, frequently by staging through SMEM and issuing a TMA
-   store.
+1. **加载。** TMA 复制（{ref}`chap_tma`）将 A 或 B 操作数块从 GMEM 流式传输到 SMEM。一个线程发出复制命令，预先记录预期到达的字节数。随着字节落地，TMA 引擎报告其进度，只有当所有预期字节都已交付时，完成屏障才会翻转。
+2. **计算。** `tcgen05` MMA（{ref}`chap_tensor_cores`）从 SMEM 中读取操作数块，并将乘积累加到 TMEM 块中。一个选举线程发出它，当数学运算完成时，它会发出屏障信号。
+3. **尾声。** Warpgroup 将 TMEM 累加器读回寄存器，将结果转换为输出数据类型，并将其存储到 GMEM，通常通过暂存到 SMEM 并发出 TMA 存储。
 
-Written out this way the three stages look strictly sequential, but the whole difference between a
-slow kernel and a fast one lies in **overlap**. A naive kernel really does run the steps in
-order (load, wait, compute, wait, store), and so leaves each engine sitting idle while it waits on
-the one before it. A fast kernel pipelines them instead: while the Tensor Core is computing on tile
-`k`, the TMA engine is already fetching tile `k+1`, and the epilogue is busy draining tile `k-1`, so
-all three engines stay occupied at the same time. Getting three asynchronous engines to hand work off
-to one another safely is precisely the job of the barrier and phase model
-({ref}`chap_async_barriers`), and the GEMM ladder of Part III is built on top of it.
+这样写出来，三个阶段看起来是严格顺序的，但慢内核和快内核之间的全部区别在于**重叠**。朴素内核确实按顺序运行这些步骤（加载、等待、计算、等待、存储），因此在等待前一个引擎时让每个引擎空闲。快速内核 instead 流水线化它们：当张量核心在块 `k` 上计算时，TMA 引擎已经在获取块 `k+1`，尾声代码忙于排空块 `k-1`，因此所有三个引擎同时保持忙碌。让三个异步引擎安全地相互交接工作正是屏障和阶段模型（{ref}`chap_async_barriers`）的工作，第三部分的 GEMM 阶梯建立在其之上。
 
-## What to Read Next
+## 接下来读什么
 
-Now that we have seen the high-level picture, we can move on to the chapters that dive deeper into
-the main mechanisms:
+现在我们已经看到了高层次的图景，我们可以转向更深入地探讨主要机制的章节：
 
-- {ref}`chap_tensor_cores` explains `tcgen05` compute and Tensor Memory in detail.
-- {ref}`chap_tma` covers TMA-based asynchronous data movement.
-- {ref}`chap_async_barriers` introduces the mbarrier and phase model that coordinates these engines.
+- {ref}`chap_tensor_cores` 详细解释 `tcgen05` 计算和张量内存。
+- {ref}`chap_tma` 涵盖基于 TMA 的异步数据搬运。
+- {ref}`chap_async_barriers` 介绍协调这些引擎的 mbarrier 和阶段模型。

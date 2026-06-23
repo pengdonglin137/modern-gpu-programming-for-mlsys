@@ -1,0 +1,13 @@
+# modern-gpu-programming-for-mlsys 术语表
+# 由 translate-engine 自动生成，请根据实际情况修改
+
+version: "1.0"
+language: zh-CN
+
+terms: []
+  # 添加术语示例:
+  # - en: "deadlock"
+  #   zh: "死锁"
+  # - en: "RCU"
+  #   zh: "RCU"
+  #   rule: "keep_english"

@@ -1,187 +1,187 @@
 (chap_tensor_cores)=
-# Tensor Cores: `tcgen05`
+# 张量核心：`tcgen05`
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- `tcgen05` is Blackwell's Tensor Core instruction family. Its MMA instruction performs tile matrix-multiply-accumulate work cooperatively, and the instruction is committed by one elected thread.
-- The accumulator lives in TMEM instead of registers. The epilogue later brings it back into registers with `tcgen05.ld`.
-- `cta_group::1` and `cta_group::2` control whether one CTA or two CTAs cooperate on the MMA. That choice also changes how the M dimension is mapped into TMEM.
-- Block-scaled MMA modes, such as `mxfp8` and `nvfp4`, add scale-factor operands. The data operands live in SMEM, while the scale factors are staged through TMEM.
+- `tcgen05` 是 Blackwell 的张量核心指令系列。其 MMA 指令协作执行块矩阵乘加运算，指令由一个选举线程提交。
+- 累加器存在于 TMEM 中而非寄存器中。尾声代码稍后通过 `tcgen05.ld` 将其带回寄存器。
+- `cta_group::1` 和 `cta_group::2` 控制一个 CTA 还是两个 CTA 协作执行 MMA。该选择也改变了 M 维度映射到 TMEM 的方式。
+- 分块缩放 MMA 模式（如 `mxfp8` 和 `nvfp4`）添加缩放因子操作数。数据操作数存在于 SMEM 中，而缩放因子通过 TMEM 暂存。
 :::
 
-Dense linear algebra is where modern GPUs spend most of their useful work. A normal CUDA-core matrix multiply cannot get close to the advertised peak of the chip ({ref}`chap_background`). Fast GEMM and attention kernels reach that peak by feeding the Tensor Core with the right tile shapes, layouts, and synchronization.
+密集线性代数是现代 GPU 花费大部分有用工作的地方。普通的 CUDA 核心矩阵乘法无法接近芯片的标称峰值（{ref}`chap_background`）。快速 GEMM 和注意力内核通过为张量核心提供正确的块形状、布局和同步来达到该峰值。
 
-The basic operation has not changed in spirit since Volta. A Tensor Core consumes matrix tiles, multiplies them, and accumulates the result. What changes from generation to generation is how the operation is issued, how the operands are laid out, and where the accumulator lives.
+自 Volta 以来，基本操作在本质上没有改变。张量核心消耗矩阵块，将其相乘，并累加结果。每一代变化的是操作如何发出、操作数如何布局以及累加器存在于何处。
 
-Blackwell makes a large change to the last part. The accumulator for `tcgen05` is no longer kept as a long-lived register fragment. It is written into Tensor Memory, or TMEM ({ref}`chap_tmem`). That one change affects the whole kernel. The MMA writes to TMEM. Completion is tracked asynchronously. The epilogue later loads the accumulator out of TMEM and turns it back into the register fragment it wants for conversion and stores.
+Blackwell 对最后一部分做了重大改变。`tcgen05` 的累加器不再作为长期存在的寄存器片段保存。它被写入张量内存（TMEM）（{ref}`chap_tmem`）。这一改变影响了整个内核。MMA 写入 TMEM。完成被异步跟踪。尾声代码稍后从 TMEM 加载累加器，并将其转换回它想要的寄存器片段以进行转换和存储。
 
-This chapter focuses on the compute instruction itself. TMA ({ref}`chap_tma`) is responsible for moving operands into SMEM. TMEM is responsible for holding the accumulator and some scale-factor operands. `tcgen05.mma` is the Tensor Core operation that sits between those two memory movements.
+本章重点介绍计算指令本身。TMA（{ref}`chap_tma`）负责将操作数移入 SMEM。TMEM 负责保存累加器和一些缩放因子操作数。`tcgen05.mma` 是介于这两种内存移动之间的张量核心操作。
 
 ```{raw} html
 <div style="overflow-x:auto;">
-<iframe src="../demo/tcgen05_intro.html" title="tcgen05 and Tensor Memory" loading="lazy"
+<iframe src="../demo/tcgen05_intro.html" title="tcgen05 和张量内存" loading="lazy"
         style="width:100%; min-width:1320px; height:640px; border:1px solid var(--pst-color-border, #d0d0d0); border-radius:6px;"></iframe>
 </div>
 ```
-*Interactive: `tcgen05` accumulator behavior. Toggle the transpose of A or B, pick the output width `N`, and step through `K` iterations to watch partial sums accumulate in TMEM.*
+*交互演示：`tcgen05` 累加器行为。切换 A 或 B 的转置，选择输出宽度 `N`，逐步执行 `K` 次迭代以观察部分和在 TMEM 中累加。*
 
-## The `tcgen05` MMA
+## `tcgen05` MMA
 
-A `tcgen05` MMA is the Blackwell Tensor Core matrix-multiply-accumulate instruction. It is a cooperative instruction. The work is performed for a warpgroup, and in some modes it can involve two CTAs from the same cluster. The instruction is not issued independently by every thread. One elected thread commits the operation on behalf of the participating group.
+`tcgen05` MMA 是 Blackwell 张量核心矩阵乘加指令。它是一条协作指令。工作为 warpgroup 执行，在某些模式下可以涉及同一集群中的两个 CTA。指令不是由每个线程独立发出的。一个选举线程代表参与组提交操作。
 
-It helps to separate the MMA into three questions.
+将 MMA 分为三个问题来理解会更容易。
 
-The first question is who cooperates. A normal mode uses one CTA, written as `cta_group::1`. A larger mode uses two CTAs in a cluster, written as `cta_group::2`. In both cases, the instruction represents one Tensor Core operation over a tile, not a scalar operation by one thread.
+第一个问题是谁协作。普通模式使用一个 CTA，写为 `cta_group::1`。更大的模式使用集群中的两个 CTA，写为 `cta_group::2`。在两种情况下，指令都表示跨一个块的张量核心操作，而不是一个线程的标量操作。
 
-The second question is where the operands and result live. The data operands normally live in SMEM. Some variants can also read an A operand from TMEM. The accumulator is written to TMEM. The operand layouts have to match what the Tensor Core expects, including the swizzled shared-memory layouts used by the data operands ({ref}`chap_data_layout`).
+第二个问题操作数和结果存在于何处。数据操作数通常存在于 SMEM 中。某些变体也可以从 TMEM 读取 A 操作数。累加器写入 TMEM。操作数布局必须与张量核心期望的匹配，包括数据操作数使用的 swizzled 共享内存布局（{ref}`chap_data_layout`）。
 
-The third question is how completion is observed. `tcgen05.mma` is asynchronous. Issuing the MMA does not mean the multiply-accumulate has finished. The instruction returns after the operation is committed, while the Tensor Core continues running. The kernel uses a commit group and an `mbarrier` to learn when the result is ready ({ref}`chap_async_barriers`).
+第三个问题是如何观察完成。`tcgen05.mma` 是异步的。发出 MMA 不意味着乘加已完成。指令在操作提交后返回，而张量核心继续运行。内核使用提交组和 `mbarrier` 来了解结果何时就绪（{ref}`chap_async_barriers`）。
 
-That asynchronous behavior is what makes overlap possible. A fast kernel does not issue an MMA and immediately stall until it finishes. It can issue the MMA, start preparing later tiles, and wait only when the result is actually needed. The price is that every handoff must be explicit. If the epilogue reads TMEM before the MMA completion barrier has fired, it is reading too early.
+这种异步行为使重叠成为可能。快速内核不会发出 MMA 并立即阻塞直到完成。它可以发出 MMA，开始准备后续块，只在实际需要结果时才等待。代价是每个交接必须是显式的。如果尾声代码在 MMA 完成屏障触发之前读取 TMEM，它读取得太早了。
 
-## The Accumulator Lives in TMEM
+## 累加器存在于 TMEM 中
 
-On Ampere and Hopper, the accumulator is exposed to the program as registers. The MMA produces a per-lane register fragment, and the epilogue consumes that fragment directly. This is simple, but it ties the accumulator size to the register budget of each thread.
+在 Ampere 和 Hopper 上，累加器作为寄存器暴露给程序。MMA 产生每 lane 的寄存器片段，尾声代码直接消耗该片段。这很简单，但它将累加器大小与每个线程的寄存器预算绑定在一起。
 
-Blackwell breaks that link. `tcgen05.mma` writes its accumulator into TMEM, a Blackwell memory space scoped to the CTA. The accumulator can stay in TMEM through the compute phase, and the epilogue later uses `tcgen05.ld` to load it back into registers.
+Blackwell 打破了这种联系。`tcgen05.mma` 将其累加器写入 TMEM，这是 Blackwell 作用域限定为 CTA 的内存空间。累加器可以在计算阶段保持在 TMEM 中，尾声代码稍后使用 `tcgen05.ld` 将其加载回寄存器。
 
-This changes the shape of the kernel. The register fragment is still important at the edges. The epilogue still wants registers so it can convert, apply elementwise work, and store the result. But the long-lived accumulator state is no longer a register allocation problem. It is a TMEM allocation and layout problem ({ref}`chap_tmem`).
+这改变了内核的形状。寄存器片段在边缘仍然重要。尾声代码仍然需要寄存器以进行转换、应用逐元素操作和存储结果。但长期存在的累加器状态不再是寄存器分配问题。它是 TMEM 分配和布局问题（{ref}`chap_tmem`）。
 
-This is why `tcgen05` and TMEM have to be understood together. The MMA instruction decides what tile is computed. TMEM decides where the accumulator lands. The epilogue must use the matching load path to recover the accumulator in the register layout it expects.
+这就是为什么 `tcgen05` 和 TMEM 必须一起理解。MMA 指令决定计算哪个块。TMEM 决定累加器落在何处。尾声代码必须使用匹配的加载路径，以在其期望的寄存器布局中恢复累加器。
 
-## `cta_group::1` and `cta_group::2`
+## `cta_group::1` 和 `cta_group::2`
 
-A `tcgen05` MMA can run in either `cta_group::1` or `cta_group::2` mode.
+`tcgen05` MMA 可以在 `cta_group::1` 或 `cta_group::2` 模式下运行。
 
-In `cta_group::1`, one CTA owns the MMA. Its operands are in that CTA's SMEM, and its accumulator is written into that CTA's TMEM.
+在 `cta_group::1` 中，一个 CTA 拥有 MMA。其操作数在该 CTA 的 SMEM 中，其累加器写入该 CTA 的 TMEM。
 
-In `cta_group::2`, two CTAs in a cluster cooperate on one MMA tile. Each CTA has its own SMEM and its own TMEM. The accumulator is not stored in one physical TMEM region spanning both CTAs. It is split across the two CTAs, with each CTA holding its own part. The even CTA issues the instruction and commits the completion barrier for the pair.
+在 `cta_group::2` 中，集群中的两个 CTA 协作处理一个 MMA 块。每个 CTA 有自己的 SMEM 和自己的 TMEM。累加器不是存储在跨越两个 CTA 的单个物理 TMEM 区域中。它被分成两个 CTA，每个 CTA 持有自己的部分。偶数 CTA 发出指令并提交该对的完成屏障。
 
-The choice matters because it changes how the logical accumulator tile `C(M, N)` maps to TMEM. TMEM has 128 hardware Lane rows and up to 512 hardware Col columns. In the TIRx layout notation, those axes are written as `TLane` and `TCol`. The MMA mode decides how rows and columns of `C` are placed onto those TMEM axes.
+该选择很重要，因为它改变了逻辑累加器块 `C(M, N)` 如何映射到 TMEM。TMEM 有 128 个硬件 Lane 行和最多 512 个硬件 Col 列。在 TIRx 布局表示法中，这些轴写为 `TLane` 和 `TCol`。MMA 模式决定 `C` 的行和列如何放置到这些 TMEM 轴上。
 
-There are four useful cases to keep in mind.
+有四种有用的情况要记住。
 
-The figures below follow the demo color convention: purple marks SMEM operands, orange marks TMEM accumulator state, and green marks the Tensor Core MMA path. CTA identity is shown by labels and position rather than by changing those hardware colors.
+下面的图遵循演示颜色约定：紫色标记 SMEM 操作数，橙色标记 TMEM 累加器状态，绿色标记张量核心 MMA 路径。CTA 标识通过标签和位置显示，而不是通过更改这些硬件颜色。
 
-### `cta_group::1`, `M = 128`
+### `cta_group::1`，`M = 128`
 
-This is the simplest case. One CTA computes a 128-row tile. TMEM also has 128 Lane rows. The mapping is therefore direct: row `m` of the accumulator maps to Lane `m`, and the N dimension maps to TMEM columns.
+这是最简单的情况。一个 CTA 计算 128 行的块。TMEM 也有 128 个 Lane 行。因此映射是直接的：累加器的第 `m` 行映射到 Lane `m`，N 维度映射到 TMEM 列。
 
-The result fills 128 Lane rows by N Col columns. This is the baseline picture. The CTA owns A and B in SMEM, and it owns the full accumulator tile in its TMEM.
+结果填充 128 个 Lane 行乘 N 个 Col 列。这是基线图。CTA 在 SMEM 中拥有 A 和 B，在其 TMEM 中拥有完整的累加器块。
 
-![cta_group::1, M=128: row m maps directly to TMEM Lane m](../img/mma_cg1_m128.svg)
+![cta_group::1, M=128：行 m 直接映射到 TMEM Lane m](../img/mma_cg1_m128.svg)
 
-### `cta_group::1`, `M = 64`
+### `cta_group::1`，`M = 64`
 
-With `M = 64`, the accumulator has only 64 rows, but TMEM still has 128 Lane rows. The hardware does not simply pack rows 0 through 63 into lanes 0 through 63. Instead, it spreads them across the 128 lanes in four runs of 16 rows.
+当 `M = 64` 时，累加器只有 64 行，但 TMEM 仍然有 128 个 Lane 行。硬件不是简单地将第 0 到 63 行打包到第 0 到 63 lane 中。相反，它以四次 16 行的运行将它们分布在 128 个 lane 中。
 
-Rows 0 through 15 go to lanes 0 through 15. Rows 16 through 31 go to lanes 32 through 47. Rows 32 through 47 go to lanes 64 through 79. Rows 48 through 63 go to lanes 96 through 111.
+第 0 到 15 行进入第 0 到 15 lane。第 16 到 31 行进入第 32 到 47 lane。第 32 到 47 行进入第 64 到 79 lane。第 48 到 63 行进入第 96 到 111 lane。
 
-This leaves gaps at lanes 16 through 31, 48 through 63, 80 through 95, and 112 through 127. Those gaps are intentional. With a different lane alignment, another independent `M = 64` MMA can occupy the complementary lanes. This lets two smaller M tiles share the 128-lane TMEM structure without stepping on each other.
+这在第 16 到 31、48 到 63、80 到 95 和 112 到 127 lane 留下间隙。这些间隙是有意的。通过不同的 lane 对齐，另一个独立的 `M = 64` MMA 可以占用互补的 lane。这使两个较小的 M 块可以共享 128 lane 的 TMEM 结构而不会相互干扰。
 
-The N dimension still maps to TMEM columns. The unusual part is only the placement of M rows across Lane.
+N 维度仍然映射到 TMEM 列。不寻常的部分只是 M 行在 Lane 上的放置。
 
-![cta_group::1, M=64: four 16-row runs at a Lane stride of 32, leaving space for another aligned M=64 tile](../img/mma_cg1_m64.svg)
+![cta_group::1, M=64：四次 16 行运行，Lane 步长为 32，为另一个对齐的 M=64 块留出空间](../img/mma_cg1_m64.svg)
 
-### `cta_group::2`, `M = 256`
+### `cta_group::2`，`M = 256`
 
-When the M dimension is larger than one CTA can naturally hold, the MMA can use `cta_group::2`. For `M = 256`, the split is direct. CTA 0 holds rows 0 through 127. CTA 1 holds rows 128 through 255.
+当 M 维度大于一个 CTA 自然能容纳的大小时，MMA 可以使用 `cta_group::2`。对于 `M = 256`，拆分是直接的。CTA 0 持有第 0 到 127 行。CTA 1 持有第 128 到 255 行。
 
-Each CTA uses its own TMEM Lane rows 0 through 127 and the full N columns. Physically, this is two separate 128-row TMEM regions, one in each CTA. Logically, they form one 256 by N accumulator tile.
+每个 CTA 使用自己的 TMEM 第 0 到 127 Lane 行和完整的 N 列。物理上，这是两个独立的 128 行 TMEM 区域，每个 CTA 一个。逻辑上，它们形成一个 256 乘 N 的累加器块。
 
-Each CTA also supplies the part of A that corresponds to its M rows. B is available to both CTAs as required by the mode. The even CTA is responsible for issuing the MMA and committing the completion barrier for the pair.
+每个 CTA 还提供与其 M 行对应的 A 的部分。B 按模式要求对两个 CTA 可用。偶数 CTA 负责发出 MMA 并提交该对的完成屏障。
 
-This is the mode used by the two-CTA cluster GEMM in {ref}`chap_gemm_advanced`.
+这是 {ref}`chap_gemm_advanced` 中双 CTA 集群 GEMM 使用的模式。
 
-![cta_group::2, M=256: M split contiguously across two CTAs, 128 rows per CTA](../img/mma_cg2_m256.svg)
+![cta_group::2, M=256：M 跨两个 CTA 连续拆分，每个 CTA 128 行](../img/mma_cg2_m256.svg)
 
-### `cta_group::2`, `M = 128`
+### `cta_group::2`，`M = 128`
 
-The `cta_group::2`, `M = 128` mode still uses two CTAs, but the M dimension is shorter. Since there are only 128 rows total, each CTA receives 64 M rows.
+`cta_group::2`，`M = 128` 模式仍然使用两个 CTA，但 M 维度更短。由于总共只有 128 行，每个 CTA 接收 64 个 M 行。
 
-The remaining lane capacity is used to pack the N dimension. Inside each CTA, one half of N occupies lanes 0 through 63, and the other half of N occupies lanes 64 through 127. This lets each CTA use all 128 Lane rows even though it owns only 64 rows of M.
+剩余的 lane 容量用于打包 N 维度。在每个 CTA 内，N 的一半占用第 0 到 63 lane，N 的另一半占用第 64 到 127 lane。这使每个 CTA 可以使用所有 128 个 Lane 行，即使它只拥有 64 行 M。
 
-So the split has two parts. M is split across the CTA pair, with 64 rows per CTA. N is then split within each CTA across the lower and upper halves of the TMEM Lane rows.
+因此拆分有两部分。M 跨 CTA 对拆分，每个 CTA 64 行。然后 N 在每个 CTA 内跨 TMEM Lane 行的下半部分和上半部分拆分。
 
-![cta_group::2, M=128: 64 M rows per CTA, with the two halves of N stacked across the lower and upper Lane halves](../img/mma_cg2_m128.svg)
+![cta_group::2, M=128：每个 CTA 64 个 M 行，N 的两半堆叠在 Lane 的下半部分和上半部分](../img/mma_cg2_m128.svg)
 
-Across these modes, the principle is the same. `tcgen05.mma` computes a logical accumulator tile, but that tile must be placed into the physical 128 Lane by up to 512 Col TMEM space. The mode and M shape determine that placement. The rest of the kernel has to use the same mapping when it later reads the accumulator back out.
+在所有这些模式中，原理相同。`tcgen05.mma` 计算逻辑累加器块，但该块必须放入物理 128 Lane 乘最多 512 Col 的 TMEM 空间。模式和 M 形状决定该放置。内核的其余部分在稍后读取累加器时必须使用相同的映射。
 
-For the kernels here, the accumulator is usually f32 in TMEM. That is the common high-accuracy path. It is not the only possible accumulator type. The `.kind::f16` path can accumulate in f16.
+对于这里的内核，TMEM 中的累加器通常是 f32。这是常见的高精度路径。它不是唯一可能的累加器类型。`.kind::f16` 路径可以在 f16 中累加。
 
-## Operand Placement
+## 操作数放置
 
-For the dense MMA modes, A and B are prepared in SMEM before the MMA runs. TMA is responsible for moving global memory tiles into SMEM. The kernel arranges those SMEM tiles in the layouts expected by the Tensor Core, including any required swizzle.
+对于密集 MMA 模式，A 和 B 在 MMA 运行之前在 SMEM 中准备。TMA 负责将全局内存块移入 SMEM。内核将这些 SMEM 块安排在张量核心期望的布局中，包括任何需要的 swizzle。
 
-The accumulator C is written to TMEM. That is the main difference from earlier generations. The epilogue does not receive the accumulator directly as the output of the MMA instruction. It must explicitly load from TMEM with `tcgen05.ld`.
+累加器 C 写入 TMEM。这是与前几代的主要区别。尾声代码不直接接收 MMA 指令的累加器输出。它必须使用 `tcgen05.ld` 显式从 TMEM 加载。
 
-In `cta_group::1`, one CTA supplies the operands and owns the accumulator. In `cta_group::2`, each CTA supplies its own side of the operands from its own SMEM, and each CTA owns its own TMEM portion of the accumulator. When A is split by M, each CTA keeps the A rows for its own M slice. B is shared according to the mode, since both M slices multiply against the same N by K tile.
+在 `cta_group::1` 中，一个 CTA 提供操作数并拥有累加器。在 `cta_group::2` 中，每个 CTA 从自己的 SMEM 提供操作数的自己一侧，每个 CTA 拥有自己的 TMEM 累加器部分。当 A 按 M 拆分时，每个 CTA 保留其自己的 M 切片的 A 行。B 根据模式共享，因为两个 M 切片都乘以相同的 N 乘 K 块。
 
-This separation is important when reading the kernel. SMEM placement answers how the Tensor Core reads A and B. TMEM placement answers where the accumulator goes. The two layouts are related by the MMA mode, but they are not the same memory space and cannot be treated as interchangeable.
+这种分离在阅读内核时很重要。SMEM 放置回答张量核心如何读取 A 和 B。TMEM 放置回答累加器去向。两种布局通过 MMA 模式相关，但它们不是相同的内存空间，不能视为可互换。
 
-## Block-Scaled MMA
+## 分块缩放 MMA
 
-The dense modes read their data operands directly from SMEM and accumulate into TMEM. Block-scaled MMA adds two more operands: scale-factor tensors for A and B.
+密集模式直接从 SMEM 读取其数据操作数，并累加到 TMEM 中。分块缩放 MMA 添加两个额外操作数：A 和 B 的缩放因子张量。
 
-This is used for very low-precision formats such as `mxfp8` and `nvfp4`. Low-precision formats are efficient, but their dynamic range is small. A single global scale is usually too crude. If the scale is chosen for the largest values, smaller values lose precision. If the scale is chosen for small values, larger values may clip.
+这用于极低精度格式，如 `mxfp8` 和 `nvfp4`。低精度格式效率高，但动态范围小。单个全局缩放通常太粗糙。如果缩放为最大值选择，较小的值会丢失精度。如果缩放为较小的值选择，较大的值可能被截断。
 
-Block scaling fixes this by assigning scale factors to small K blocks. A group of consecutive K elements shares one scale. The MMA conceptually dequantizes each block with its scale and then accumulates the products in the accumulator type.
+分块缩放通过将缩放因子分配给小 K 块来解决这个问题。一组连续的 K 元素共享一个缩放因子。MMA 概念上用其缩放因子反量化每个块，然后在累加器类型中累乘积。
 
-For A and B, this introduces two scale-factor tensors:
+对于 A 和 B，这引入了两个缩放因子张量：
 
 ```text
 SFA(M, SFK)
 SFB(N, SFK)
 ```
 
-where `SFK = K / B`, and `B` is the block size along K.
+其中 `SFK = K / B`，`B` 是沿 K 的块大小。
 
-The exact block size depends on the format. The important point is that the scale axis follows K at a coarser granularity. Each scale factor describes a block of K values, not one individual element and not the whole matrix.
+确切的块大小取决于格式。重要的是缩放轴以更粗的粒度跟随 K。每个缩放因子描述一个 K 值块，而不是单个元素，也不是整个矩阵。
 
-The mathematical shape is:
+数学形式是：
 
 ```text
 acc += (Aq * scale_a) * (Bq * scale_b)
 ```
 
-where `Aq` and `Bq` are quantized low-precision values, and the scales restore their approximate magnitudes before accumulation.
+其中 `Aq` 和 `Bq` 是量化的低精度值，缩放因子在累加之前恢复其近似幅度。
 
-The scale dtype also matters. With `e8m0` scales, each scale is effectively a power of two. With `e4m3` scales, as used by `nvfp4`, the scale is a small floating-point value and can represent values between powers of two.
+缩放数据类型也很重要。使用 `e8m0` 缩放时，每个缩放因子实际上是 2 的幂。使用 `e4m3` 缩放（如 `nvfp4` 所用），缩放因子是小浮点值，可以表示 2 的幂之间的值。
 
-## Where the Scale Factors Live
+## 缩放因子存在于何处
 
-Block-scaled `tcgen05.mma` differs from the dense MMA in one important placement rule: the scale factors are read from TMEM.
+分块缩放 `tcgen05.mma` 与密集 MMA 在一个重要放置规则上不同：缩放因子从 TMEM 读取。
 
-The data operands A and B are still staged in SMEM. The scale factors SFA and SFB are staged through TMEM. Since TMA loads into SMEM, the scale factors usually take an extra step. The kernel first loads them into SMEM, then copies them from SMEM to TMEM with `tcgen05.cp`. Only after the scale factors are in TMEM can the block-scaled MMA read them.
+数据操作数 A 和 B 仍然暂存在 SMEM 中。缩放因子 SFA 和 SFB 通过 TMEM 暂存。由于 TMA 加载到 SMEM，缩放因子通常需要额外一步。内核首先将它们加载到 SMEM，然后使用 `tcgen05.cp` 将它们从 SMEM 复制到 TMEM。只有在缩放因子进入 TMEM 之后，分块缩放 MMA 才能读取它们。
 
-This gives the scale factors a different movement path from the data operands:
+这给了缩放因子与数据操作数不同的移动路径：
 
 ```text
-A, B:     global memory to SMEM, then MMA reads SMEM
-SFA, SFB: global memory to SMEM, then tcgen05.cp copies SMEM to TMEM, then MMA reads TMEM
+A, B:     全局内存到 SMEM，然后 MMA 读取 SMEM
+SFA, SFB: 全局内存到 SMEM，然后 tcgen05.cp 将 SMEM 复制到 TMEM，然后 MMA 读取 TMEM
 ```
 
-The TMEM layout for scale factors is compact. A 128-row scale vector can pack into 32 Lane rows, using a mapping based on `r % 32` for the lane position and `r / 32` along columns. The data can then be broadcast across the four warps that read the full 128 Lane space ({ref}`chap_layout_generations`).
+缩放因子的 TMEM 布局是紧凑的。128 行缩放向量可以打包到 32 个 Lane 行中，使用基于 `r % 32` 的 lane 位置和沿列的 `r / 32` 的映射。然后数据可以广播到读取完整 128 Lane 空间的四个 warp（{ref}`chap_layout_generations`）。
 
-This is a good example of why TMEM layout has to be explicit. The accumulator layout and the scale-factor layout are both in TMEM, but they are not the same layout. The accumulator uses the MMA output mapping. The scale factors use the compact layout expected by the block-scaled MMA.
+这是为什么 TMEM 布局必须显式化的好例子。累加器布局和缩放因子布局都在 TMEM 中，但它们不是相同的布局。累加器使用 MMA 输出映射。缩放因子使用分块缩放 MMA 期望的紧凑布局。
 
-## Scale Factors in `cta_group::2`
+## `cta_group::2` 中的缩放因子
 
-In the two-CTA case, scale factors follow the data they scale.
+在双 CTA 情况下，缩放因子跟随它们缩放的数据。
 
-SFA scales A. Since A is split by M across the CTA pair, SFA is also split by M. Each CTA holds the SFA rows that correspond to its own A rows.
+SFA 缩放 A。由于 A 跨 CTA 对按 M 拆分，SFA 也按 M 拆分。每个 CTA 持有与其自身 A 行对应的 SFA 行。
 
-SFB scales B. Since both CTAs multiply against the same B tile, SFB has to be visible to both CTAs. In practice, that means SFB is multicast across the CTA pair.
+SFB 缩放 B。由于两个 CTA 都乘以相同的 B 块，SFB 必须对两个 CTA 可见。实际上，这意味着 SFB 跨 CTA 对多播。
 
-This is the source of the common loading pattern in block-scaled cluster GEMM. SFA is loaded per CTA, using the mask for the CTA's own M slice. SFB is broadcast to the pair, because both CTAs need the same N-side scale factors.
+这是分块缩放集群 GEMM 中常见加载模式的来源。SFA 按 CTA 加载，使用 CTA 自己 M 切片的掩码。SFB 广播到该对，因为两个 CTA 需要相同的 N 侧缩放因子。
 
-![Block-scaled MMA placement: A and B packed in SMEM; SFA, SFB, and C in TMEM, with SFA split by M across CTAs and SFB multicast across the CTA pair](../img/mma_block_scaled.svg)
+![分块缩放 MMA 放置：A 和 B 打包在 SMEM 中；SFA、SFB 和 C 在 TMEM 中，SFA 跨 CTA 按 M 拆分，SFB 跨 CTA 对多播](../img/mma_block_scaled.svg)
 
-## Keeping the MMA Contracts Matched
+## 保持 MMA 契约匹配
 
-A Blackwell GEMM tile moves through several specialized paths.
+Blackwell GEMM 块经过几条专用路径。
 
-TMA brings A and B from global memory into SMEM. For block-scaled modes, it also brings scale factors into SMEM. `tcgen05.cp` moves those scale factors into TMEM when needed. `tcgen05.mma` reads its operands, runs asynchronously on the Tensor Core, and accumulates into TMEM. The completion barrier tells the kernel when that accumulator is ready. The epilogue then uses `tcgen05.ld` to load the accumulator from TMEM back into registers and store the final output.
+TMA 将 A 和 B 从全局内存带入 SMEM。对于分块缩放模式，它还将缩放因子带入 SMEM。`tcgen05.cp` 在需要时将这些缩放因子移入 TMEM。`tcgen05.mma` 读取其操作数，在张量核心上异步运行，并累加到 TMEM 中。完成屏障告诉内核累加器何时就绪。然后尾声代码使用 `tcgen05.ld` 将累加器从 TMEM 加载回寄存器并存储最终输出。
 
-Across those paths, the kernel has to keep three contracts matched: the SMEM operand layout, the TMEM accumulator or scale-factor layout, and the asynchronous completion signal that makes the next consumer safe to run.
+跨这些路径，内核必须保持三个契约匹配：SMEM 操作数布局、TMEM 累加器或缩放因子布局，以及使下一个消费者安全运行的异步完成信号。

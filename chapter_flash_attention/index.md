@@ -1,40 +1,40 @@
 (chap_flash_attention)=
 # Flash Attention 4
 
-:::{admonition} Overview
+:::{admonition} 概览
 :class: overview
 
-- Attention runs two MMAs with softmax wedged between them, so it cannot just repeat one MMA the way GEMM does.
-- The kernel composes the hardware primitives from Part I (TMA, `tcgen05`, TMEM, barriers) and the GEMM techniques from Part III with warp roles, online-softmax rescaling, causal masking, and GQA.
+- 注意力运行两个 MMA，中间夹着 softmax，因此不能像 GEMM 那样重复一个 MMA。
+- 内核组合第一部分的硬件原语（TMA、`tcgen05`、TMEM、屏障）和第三部分的 GEMM 技术，加上 warp 角色、在线 softmax 重缩放、因果掩码和 GQA。
 :::
 
-Attention is the kernel that decides whether a transformer runs at all, and it is also where everything we built so far finally has to work together. Every piece we assembled for GEMM carries over here: TMA tile movement, `tcgen05` MMA, TMEM, warpgroup register tiles, and explicit barriers.
+注意力是决定 transformer 能否运行的内核，也是我们到目前为止构建的所有内容最终必须协同工作的地方。我们为 GEMM 组装的每个部分都延续到这里：TMA 块移动、`tcgen05` MMA、TMEM、warpgroup 寄存器块和显式屏障。
 
-The challenge is that attention is not one MMA repeated. It is two MMAs with real work wedged between them: online softmax, causal masking, and the rescaling that keeps earlier and later blocks in a common scale.
+挑战在于注意力不是一个 MMA 的重复。它是两个 MMA，中间夹着真正的工作：在线 softmax、因果掩码以及保持前后块在共同缩放中的重缩放。
 
-That middle stage is where the new difficulty lives. A plain matmul only adds to its accumulator; attention has to revisit and rescale results it already computed as new keys and values stream in. The softmax work itself also runs on CUDA cores between the two Tensor Core MMAs, so exponentials and row-wise reductions sit directly on the critical path.
+中间阶段是新困难所在。普通矩阵乘法只是累加到累加器；注意力必须在新的键和值流式传入时重新访问和重缩放它已经计算的结果。softmax 工作本身也在两个张量核心 MMA 之间在 CUDA 核心上运行，因此指数和行级归约直接位于关键路径上。
 
-That is why so much of attention optimization is really softmax optimization: reformulating `exp`, and overlapping softmax with the MMAs instead of stalling on it.
+这就是为什么注意力优化的大部分实际上是 softmax 优化：重新表述 `exp`，并将 softmax 与 MMA 重叠而不是在它上面停顿。
 
-Our goal in this chapter is not to re-derive Flash Attention from scratch. We will keep just enough of the algorithm in view to make the kernel readable, and then spend our attention on the part that is genuinely new: how that algorithm turns into TIRx.
+我们在本章的目标不是从头重新推导 Flash Attention。我们将只保留足够的算法使内核可读，然后将注意力放在真正新的部分：该算法如何转化为 TIRx。
 
-The clearest way in is to follow a single tile as it flows through the kernel. `Q`, `K`, and `V` enter as input tiles, loaded from GMEM into SMEM. The score MMA multiplies `Q` and `K` into a score tile `S` in TMEM. Softmax turns `S` into a numerator tile `P`, and the value MMA combines `P` and `V` to update the output accumulator `O`.
+最清晰的方式是跟踪一个块流经内核的过程。`Q`、`K` 和 `V` 作为输入块进入，从 GMEM 加载到 SMEM。分数 MMA 将 `Q` 和 `K` 乘入 TMEM 中的分数块 `S`。Softmax 将 `S` 转换为分子块 `P`，值 MMA 组合 `P` 和 `V` 以更新输出累加器 `O`。
 
-So far this looks like two matmuls glued together, but there is one twist that GEMM never had to deal with: whenever the running softmax maximum changes, the `O` accumulated so far is suddenly in the wrong scale. It must be rescaled before the next value MMA can safely add into it. The sections below trace this path first, and only then show how TIRx hands each stage to a warpgroup and wires the stages together.
+到目前为止，这看起来像两个矩阵乘法粘在一起，但有一个 GEMM 从未必须处理的转折：每当运行的 softmax 最大值改变时，到目前为止累加的 `O` 突然处于错误的缩放中。在下一个值 MMA 安全地累加到它之前，必须重新缩放它。下面的章节首先跟踪这条路径，然后才展示 TIRx 如何将每个阶段交给 warpgroup 并将阶段连接在一起。
 
-## Algorithm Shape
+## 算法形状
 
-Before we can place tiles in memory, we need the algorithm those tiles serve. For one query block, Flash Attention computes:
+在我们可以将块放入内存之前，我们需要这些块服务的算法。对于一个查询块，Flash Attention 计算：
 
 $$O = \text{softmax}(QK^{\top} / \sqrt{d})V$$
 
-Read literally, the formula says to form the full score matrix `S = QKᵀ`, softmax it, then multiply by `V`. That is the one approach we cannot use, because the full `S` is enormous. At seq=4096 it holds roughly 16M elements per head, about 64 MB in fp32, which is orders of magnitude larger than SMEM or the single 128×512 TMEM region. There is simply nowhere on-chip to put it. Flash Attention's answer is to never materialize `S` at all. Instead it streams `K/V` in blocks and carries three per-row running states that summarize everything seen so far:
+字面上阅读，该公式说要形成完整分数矩阵 `S = QKᵀ`，对其做 softmax，然后乘以 `V`。这是我们不能使用的方法，因为完整的 `S` 巨大。在 seq=4096 时，每个头大约有 1600 万个元素，fp32 中约 64 MB，比 SMEM 或单个 128×512 TMEM 区域大几个数量级。芯片上根本没有地方放置它。Flash Attention 的答案是根本不具体化 `S`。相反，它以块流式传输 `K/V`，并携带三个每行运行状态，总结到目前为止看到的所有内容：
 
-- `row_max`: the maximum score seen so far.
-- `row_sum`: the running denominator of softmax.
-- `O`: the running output accumulator.
+- `row_max`：到目前为止看到的最大分数。
+- `row_sum`：softmax 的运行分母。
+- `O`：运行输出累加器。
 
-The streaming update is what keeps those states correct as new blocks arrive. The subtlety is that each time we process a block, the running max may rise, and once it does, everything we computed under the old max is now on the wrong scale. So before adding the new contribution, we first pull the old state back into the new scale:
+流式更新使这些状态在新块到达时保持正确。微妙之处在于，每次我们处理一个块时，运行最大值可能上升，一旦上升，我们在旧最大值下计算的所有内容现在处于错误的缩放中。因此在添加新贡献之前，我们首先将旧状态拉回到新的缩放中：
 
 ```text
 S = Q_block @ K_block.T
@@ -46,128 +46,128 @@ O = O * scale + P @ V_block
 row_max = m_new
 ```
 
-The single `scale` factor does double duty here: it rescales both the running denominator and the running output, so that the contributions from earlier and later blocks finally end up measured in a common scale.
+单个 `scale` 因子在这里承担双重职责：它重新缩放运行分母和运行输出，使前后块的贡献最终以共同缩放衡量。
 
-The pseudocode above is written with natural `exp` and an explicit `/sqrt(d)` because that is easiest to read, but the kernel takes a cheaper route. It folds both `1/sqrt(d)` and `log2(e)` into one constant `scale_log2 = log2(e)/sqrt(d)` and evaluates every exponential with the hardware `exp2` on raw scores, using the identity `exp(x/sqrt(d)) = exp2(x · scale_log2)`. The motivation is simply that `exp2` is faster than a natural `exp` on this hardware.
+上面的伪代码使用自然 `exp` 和显式 `/sqrt(d)` 书写，因为这样最容易阅读，但内核采取更便宜的路线。它将 `1/sqrt(d)` 和 `log2(e)` 折叠为一个常数 `scale_log2 = log2(e)/sqrt(d)`，并使用硬件 `exp2` 在原始分数上评估每个指数，使用恒等式 `exp(x/sqrt(d)) = exp2(x · scale_log2)`。动机很简单：在这种硬件上 `exp2` 比自然 `exp` 更快。
 
-One point is worth pinning down before we go on: `P` here is *not* the final normalized attention matrix. It is only the softmax numerator for the current K/V block. The normalization is deliberately deferred, and only after the last block does the kernel write `O / row_sum`.
+有一点值得在我们继续之前确定：这里的 `P` *不是*最终的归一化注意力矩阵。它只是当前 K/V 块的 softmax 分子。归一化被故意推迟，只有在最后一个块之后，内核才写入 `O / row_sum`。
 
-For TIRx, knowing what the algorithm computes is only half the picture. The other half is *where each tile lives* as the kernel runs, because that is what dictates the layout and barrier code. `S`, `P`, and `O` are all tile values, and each one has a home:
+对于 TIRx，知道算法计算什么只是故事的一半。另一半是*每个块存在于何处*，因为那是决定布局和屏障代码的因素。`S`、`P` 和 `O` 都是块值，每个都有一个位置：
 
-- `S` is the score tile. The score MMA writes it to TMEM.
-- `P` is the softmax numerator tile. Softmax reads `S` from TMEM into registers, computes `P = exp((S - m_new) / sqrt(d))`, and writes `P` back to TMEM.
-- `O` is the output accumulator tile. The value MMA reads `P` from TMEM and `V` from SMEM, then accumulates into `O` in TMEM.
+- `S` 是分数块。分数 MMA 将其写入 TMEM。
+- `P` 是 softmax 分子块。Softmax 从 TMEM 读取 `S` 到寄存器，计算 `P = exp((S - m_new) / sqrt(d))`，并将 `P` 写回 TMEM。
+- `O` 是输出累加器块。值 MMA 从 TMEM 读取 `P`，从 SMEM 读取 `V`，然后累加到 TMEM 中的 `O`。
 
-The rescale we flagged earlier is also a tile operation, not a piece of scalar bookkeeping: when `row_max` changes, the old `O` is read from TMEM, multiplied in registers, and written back to TMEM before the next value MMA accumulates into it. Every later section follows that same structure: a tile placement, a hardware path, and the barrier that proves the next consumer may run.
+我们之前标记的重缩放也是一个块操作，不是标量簿记：当 `row_max` 改变时，旧 `O` 从 TMEM 读取，在寄存器中相乘，然后写回 TMEM，然后下一个值 MMA 累加到其中。每个后续章节遵循相同的结构：块放置、硬件路径，以及证明下一个消费者可以运行的屏障。
 
-## Tile-Primitive Graph
+## 块原语图
 
-With the running states and their homes in hand, we can lay the algorithm out as a concrete sequence of tile moves. For one K/V block, the kernel walks this tile path top to bottom:
+有了运行状态及其位置，我们可以将算法布局为具体的块移动序列。对于一个 K/V 块，内核从上到下走这条块路径：
 
 ```text
-Q, K, V in GMEM
-  -> Q, K, V in SMEM        by TMA load
-  -> S in TMEM              by score MMA: QK^T
-  -> P in TMEM              by softmax numerator: TMEM -> RF -> TMEM
-  -> O in TMEM              by value MMA: P V
-  -> O in GMEM              by normalization, SMEM staging, and TMA store
+Q, K, V 在 GMEM 中
+  -> Q, K, V 在 SMEM 中        通过 TMA 加载
+  -> S 在 TMEM 中              通过分数 MMA: QK^T
+  -> P 在 TMEM 中              通过 softmax 分子: TMEM -> RF -> TMEM
+  -> O 在 TMEM 中              通过值 MMA: P V
+  -> O 在 GMEM 中              通过归一化、SMEM 暂存和 TMA 存储
 ```
 
-The difference from GEMM comes down to a single line. GEMM is one MMA chain repeated; FA4 has two MMA phases with softmax sitting in the middle of the chain. Almost everything else that follows is a consequence of that one extra stage.
+与 GEMM 的区别归结为一行。GEMM 是一个 MMA 链的重复；FA4 有两个 MMA 阶段，softmax 夹在链的中间。几乎所有后续内容都是那个额外阶段的后果。
 
-If we expand the short path into explicit producer-consumer edges, we get the full graph:
+如果我们将短路径扩展为显式的生产者-消费者边，我们得到完整的图：
 
-| Stage | Tile movement or compute | TIRx primitive | Hardware path |
-|-------|--------------------------|----------------|---------------|
-| Load Q/K/V | GMEM tiles -> SMEM tiles | `Tx.copy_async(..., dispatch="tma")` | TMA load |
-| Score MMA | Q in SMEM and K in SMEM -> score tile `S` in TMEM | `Tx.warp.gemm_async(..., dispatch="tcgen05")` | `tcgen05.mma` |
-| Softmax read | `S` in TMEM -> warpgroup register tile | `Tx.wg.copy_async(reg, tmem)` | `tcgen05.ld` |
-| Softmax write | numerator tile `P` in registers -> fp16 TMEM view | `Tx.copy_async(tmem_as_f16, reg)` | TMEM store, followed by `tcgen05.wait.st()` |
-| Value MMA | `P` in TMEM and V in SMEM -> output accumulator `O` in TMEM | `Tx.warp.gemm_async(..., dispatch="tcgen05")` | `tcgen05.mma` with a TMEM operand |
-| Correction | `O` in TMEM -> registers -> `O` in TMEM | TMEM readback, register multiply, TMEM store | `tcgen05.ld` / TMEM store |
-| Epilogue | final `O` in TMEM -> registers -> SMEM -> GMEM | TMEM readback, `Tx.copy`, TMA store | `tcgen05.ld` + TMA store |
+| 阶段 | 块移动或计算 | TIRx 原语 | 硬件路径 |
+|------|------------|----------|---------|
+| 加载 Q/K/V | GMEM 块 -> SMEM 块 | `Tx.copy_async(..., dispatch="tma")` | TMA 加载 |
+| 分数 MMA | SMEM 中的 Q 和 K -> TMEM 中的分数块 `S` | `Tx.warp.gemm_async(..., dispatch="tcgen05")` | `tcgen05.mma` |
+| Softmax 读取 | TMEM 中的 `S` -> warpgroup 寄存器块 | `Tx.wg.copy_async(reg, tmem)` | `tcgen05.ld` |
+| Softmax 写入 | 寄存器中的分子块 `P` -> fp16 TMEM 视图 | `Tx.copy_async(tmem_as_f16, reg)` | TMEM 存储，后跟 `tcgen05.wait.st()` |
+| 值 MMA | TMEM 中的 `P` 和 SMEM 中的 V -> TMEM 中的输出累加器 `O` | `Tx.warp.gemm_async(..., dispatch="tcgen05")` | 带 TMEM 操作数的 `tcgen05.mma` |
+| 修正 | TMEM 中的 `O` -> 寄存器 -> TMEM 中的 `O` | TMEM 回读、寄存器乘法、TMEM 存储 | `tcgen05.ld` / TMEM 存储 |
+| 尾声 | TMEM 中的最终 `O` -> 寄存器 -> SMEM -> GMEM | TMEM 回读、`Tx.copy`、TMA 存储 | `tcgen05.ld` + TMA 存储 |
 
-The new rows are softmax and correction. Both add TMEM -> register -> TMEM traffic, and both create extra handoffs between the score MMA and the value MMA.
+新行是 softmax 和修正。两者都添加 TMEM -> 寄存器 -> TMEM 流量，两者都在分数 MMA 和值 MMA 之间创建额外的交接。
 
-**Try with your agent**: Ask it to trace only the short path above. For each arrow, name the producer stage, consumer stage, source tile, destination tile, and hardware path. Then ask which arrows did not exist in the GEMM chapters.
+**试一试**：让它只跟踪上面的短路径。对于每条箭头，命名生产者阶段、消费者阶段、源块、目标块和硬件路径。然后问哪些箭头在 GEMM 章节中不存在。
 
-## Warp Roles and Scopes
+## Warp 角色和作用域
 
-With the data path settled, the natural next question is who actually runs each stage. Each CTA here has 4 warpgroups, 512 threads in all, and they are split not by which data they touch but by *what kind of work* a warpgroup does:
+数据路径确定后，自然的下一个问题是谁实际运行每个阶段。这里的每个 CTA 有 4 个 warpgroup，总共 512 个线程，它们不是按接触的数据分配，而是按 warpgroup 做的*工作类型*分配：
 
-- WG3 drives the hardware engines: TMA load, MMA, and TMA store.
-- WG0, WG1, and WG2 do the register-heavy math that happens between those engine calls: softmax, correction, and epilogue.
+- WG3 驱动硬件引擎：TMA 加载、MMA 和 TMA 存储。
+- WG0、WG1 和 WG2 执行引擎调用之间发生的寄存器密集型数学：softmax、修正和尾声。
 
-The exact role table is:
+确切的角色表是：
 
-| Owner | Role | What it does |
-|-------|------|--------------|
-| WG3, warp 1 | TMA load | Loads Q, K, and V tiles from GMEM to SMEM |
-| WG3, warp 0 | MMA | Issues both score MMA and value MMA |
-| WG3, warp 2 | TMA store | Stores final O tiles from SMEM to GMEM |
-| WG0 | Softmax for Q stage 0 | Reads S from TMEM, computes P, writes P to TMEM |
-| WG1 | Softmax for Q stage 1 | Same work for the second Q pipeline stage |
-| WG2 | Correction and epilogue | Rescales O in TMEM, normalizes, stages output |
+| 拥有者 | 角色 | 做什么 |
+|--------|------|--------|
+| WG3, warp 1 | TMA 加载 | 从 GMEM 加载 Q、K 和 V 块到 SMEM |
+| WG3, warp 0 | MMA | 发出分数 MMA 和值 MMA |
+| WG3, warp 2 | TMA 存储 | 将最终 O 块从 SMEM 存储到 GMEM |
+| WG0 | Q 阶段 0 的 Softmax | 从 TMEM 读取 S，计算 P，将 P 写入 TMEM |
+| WG1 | Q 阶段 1 的 Softmax | 第二个 Q 流水线阶段的相同工作 |
+| WG2 | 修正和尾声 | 重缩放 TMEM 中的 O，归一化，暂存输出 |
 
-It is easy to misread the "two Q stages" as two attention heads, but they are not. They are simply two slots in the Q pipeline, with WG0 owning one and WG1 the other, so that two Q tiles can be in flight at the same time. That is the reason the softmax work appears twice, once on WG0 and once on WG1.
+很容易将"两个 Q 阶段"误读为两个注意力头，但它们不是。它们只是 Q 流水线中的两个槽，WG0 拥有一个，WG1 拥有另一个，这样两个 Q 块可以同时在飞行中。这就是 softmax 工作出现两次的原因，一次在 WG0 上，一次在 WG1 上。
 
-The code picks these roles out with symbolic coordinates:
+代码用符号坐标选出这些角色：
 
 ```python
 wg_id = T.warpgroup_id([4])
 warp_id = T.warp_id_in_wg([4])
 ```
 
-When you read the kernel, find the role branch first. It tells you which team owns every tile primitive nested inside it.
+阅读内核时，首先找到角色分支。它告诉你哪个团队拥有嵌套在其中的每个块原语。
 
-- WG3 warp 1 starts TMA load commands. One elected lane issues the copy, and the TMA engine moves the tile.
-- WG3 warp 0 issues the `tcgen05.mma` instructions.
-- WG0 and WG1 run softmax under full warpgroup scope.
-- WG2 runs correction and epilogue work under full warpgroup scope.
+- WG3 warp 1 启动 TMA 加载命令。一个选举 lane 发出复制，TMA 引擎移动块。
+- WG3 warp 0 发出 `tcgen05.mma` 指令。
+- WG0 和 WG1 在完整 warpgroup 作用域下运行 softmax。
+- WG2 在完整 warpgroup 作用域下运行修正和尾声工作。
 
-One asymmetry ends up shaping the entire barrier graph: *every* MMA, both score and value, issues from WG3 warp 0 alone. WG0 and WG1 never issue an MMA at all. They only consume the score tile, run softmax, and write `P` back to TMEM.
+一个不对称最终塑造了整个屏障图：*每个* MMA，分数和值，都只从 WG3 warp 0 发出。WG0 和 WG1 从不发出 MMA。它们只消费分数块，运行 softmax，并将 `P` 写回 TMEM。
 
-This separation is precisely why softmax needs barriers around it. `s_ready` carries the score tile from the MMA warp over to softmax; `p_o_rescale` carries `P` and an `O` slot that is safe for the value MMA, either already rescaled or released because no rescale was needed. We will keep returning to those two names for the rest of the chapter.
+这种分离正是 softmax 需要屏障的原因。`s_ready` 将分数块从 MMA warp 携带到 softmax；`p_o_rescale` 携带 `P` 和一个对值 MMA 安全的 `O` 槽，要么已经重缩放，要么因为不需要重缩放而被释放。我们将在本章剩余部分不断回归这两个名称。
 
-## Reading the Fragments
+## 阅读片段
 
-The fragments in this chapter are excerpts from [`flash_attention4.py`](https://github.com/mlc-ai/tirx-kernels/blob/main/tirx_kernels/attention/flash_attention4.py), so they inevitably reference names defined in parts of the kernel we do not reproduce. The self-describing ones (`wg_id`, `warp_id`, `BLK_M`/`BLK_N`, `HEAD_DIM`, `kv_stage`, the `SMEM_PIPE_DEPTH_*` / `TMEM_PIPE_DEPTH` depths, `should_accumulate`, and `CTA_GROUP` (1 here)) we introduce where they first matter below. The rest get a one-line gloss in the table here, so you have somewhere to look the moment a fragment puts an unfamiliar name in front of you:
+本章中的片段摘自 [`flash_attention4.py`](https://github.com/mlc-ai/tirx-kernels/blob/main/tirx_kernels/attention/flash_attention4.py)，因此它们不可避免地引用内核中我们未重现的部分定义的名称。自描述的（`wg_id`、`warp_id`、`BLK_M`/`BLK_N`、`HEAD_DIM`、`kv_stage`、`SMEM_PIPE_DEPTH_*`/`TMEM_PIPE_DEPTH` 深度、`should_accumulate` 和 `CTA_GROUP`（这里为 1））我们在下面首次需要时介绍。其余的在这里的表中获得一行说明，这样当片段将不熟悉的名称放在你面前时，你有地方查看：
 
-| Name | Meaning |
-|------|---------|
-| `q_stage`, `i_q` | Q pipeline stage, 0 or 1, i.e. which Q tile slot (`SMEM_PIPE_DEPTH_Q = 2`). Inside WG0/WG1 softmax the warpgroup's own `wg_id` (0 or 1) *is* this same stage index, so `S_region[q_stage]`, `P_region[wg_id]`, and `O_region[i_q]` all select the same Q stage |
-| `MMA_N` | score/output tile width in TMEM columns (128) |
-| `MMA_K` | MMA inner-K step in `P`/`V` columns (16); `K_SPLIT = 6 * MMA_K = 96` |
-| `K_SPLIT` | split point of the value-MMA schedule (see *The Two MMA Phases*); the first value MMA covers columns `0:K_SPLIT` (`6 * MMA_K = 96`) |
-| `should_rescale` | WG2 per-row flag: whether the old `O` needs rescaling before the next value MMA (reduced across the warpgroup with `any_sync`) |
-| `rescale_threshold` | skip threshold for small row-max changes; the current kernel uses `8.0`, and a skipped rescale sets `acc_scale` to exactly `1.0` |
-| `scale_log2` | the softmax scale in log2 units, `log2(e)/√d`, so `P = exp2((S - m) · scale_log2)` |
-| `acc_scale` | per-row rescale factor softmax passes to WG2 through the SMEM mailbox |
-| `chunk_start`/`chunk_end`, `p_start`/`p_end` | column range of the 32-wide softmax chunk being read / written |
+| 名称 | 含义 |
+|------|------|
+| `q_stage`、`i_q` | Q 流水线阶段，0 或 1，即哪个 Q 块槽（`SMEM_PIPE_DEPTH_Q = 2`）。在 WG0/WG1 softmax 内，warpgroup 自己的 `wg_id`（0 或 1）*就是*相同的阶段索引，所以 `S_region[q_stage]`、`P_region[wg_id]` 和 `O_region[i_q]` 都选择相同的 Q 阶段 |
+| `MMA_N` | TMEM 列中的分数/输出块宽度（128） |
+| `MMA_K` | `P`/`V` 列中的 MMA 内部 K 步长（16）；`K_SPLIT = 6 * MMA_K = 96` |
+| `K_SPLIT` | 值 MMA 调度的拆分点（见*两个 MMA 阶段*）；第一个值 MMA 覆盖列 `0:K_SPLIT`（`6 * MMA_K = 96`） |
+| `should_rescale` | WG2 每行标志：旧 `O` 是否需要在下一个值 MMA 之前重缩放（通过 `any_sync` 在 warpgroup 内归约） |
+| `rescale_threshold` | 跳过小行最大值变化的阈值；当前内核使用 `8.0`，跳过的重缩放将 `acc_scale` 设置为恰好 `1.0` |
+| `scale_log2` | log2 单位的 softmax 缩放，`log2(e)/√d`，所以 `P = exp2((S - m) · scale_log2)` |
+| `acc_scale` | softmax 通过 SMEM 信箱传递给 WG2 的每行重缩放因子 |
+| `chunk_start`/`chunk_end`、`p_start`/`p_end` | 正在读取/写入的 32 宽 softmax 块的列范围 |
 
-## The Two MMA Phases
+## 两个 MMA 阶段
 
-For each streamed K/V tile, Flash Attention runs two MMA phases with softmax bridging them:
+对于每个流式 K/V 块，Flash Attention 运行两个 MMA 阶段，softmax 桥接它们：
 
 ```text
-Q, K -> score MMA -> S
-S    -> softmax   -> P
-P, V -> value MMA -> O
+Q, K -> 分数 MMA -> S
+S    -> softmax  -> P
+P, V -> 值 MMA   -> O
 ```
 
-Think of this as a pipeline of three producers in a row. The first MMA produces the attention scores `S`, softmax turns `S` into the numerator `P`, and the second MMA consumes `P` to update the output accumulator `O`. The normalization by `row_sum` is held back to the epilogue, once every K/V tile has had its say.
+将此视为三个生产者排成一行的流水线。第一个 MMA 产生注意力分数 `S`，softmax 将 `S` 转换为分子 `P`，第二个 MMA 消费 `P` 以更新输出累加器 `O`。`row_sum` 的归一化被推迟到尾声，一旦每个 K/V 块都发表了意见。
 
-Each tile op below gets the same **scope / layout / dispatch** card we used for the GEMM steps, with one extra line, **Handoff**, that names the barrier(s) passing the tile to the next role.
+下面的每个块操作都获得我们用于 GEMM 步骤的相同**作用域/布局/调度**卡片，外加一行**交接**，命名将块传递给下一个角色的屏障。
 
-The compute code never speaks in raw TMEM column numbers. Instead the kernel carves its single TMEM allocation into per-stage views (`S_region`, `P_region`, `O_region`) and indexes them by pipeline stage (`S_region[q_stage]`, `O_region[i_q]`, `P_region[i_q, 0:K_SPLIT]`). Those views are defined with `T.TMEMStages` in the [TMEM Layout and Reuse](#tmem-layout-and-reuse) section; for now it is enough to treat each region as a named slice of the same physical TMEM.
+计算代码从不以原始 TMEM 列数说话。相反，内核将其单个 TMEM 分配切割为每阶段视图（`S_region`、`P_region`、`O_region`），并按流水线阶段索引它们（`S_region[q_stage]`、`O_region[i_q]`、`P_region[i_q, 0:K_SPLIT]`）。这些视图在 [TMEM 布局和重用](#tmem-layout-and-reuse) 部分用 `T.TMEMStages` 定义；现在将每个区域视为同一物理 TMEM 的命名切片就足够了。
 
-### Score MMA
+### 分数 MMA
 
-The first of the two phases is the score MMA, the matmul that opens every K/V iteration. It computes:
+两个阶段中的第一个是分数 MMA，打开每次 K/V 迭代的矩阵乘法。它计算：
 
 $$S = Q_{\text{block}}K_{\text{block}}^{\top}$$
 
-and writes the `128 x 128` score tile to TMEM:
+并将 `128×128` 分数块写入 TMEM：
 
 ```python
 Tx.warp.gemm_async(
@@ -181,27 +181,27 @@ if T.ptx.elect_sync():
     s_ready.arrive(q_stage)
 ```
 
-We can ask the same four questions the GEMM chapters asked of every tile op: who runs it, where the tiles live, how it dispatches, and how it hands off:
+我们可以问 GEMM 章节问每个块操作的四个相同问题：谁运行它，块存在于何处，如何调度，以及如何交接：
 
-> **Tile-primitive readout: Score MMA**
-> - Scope: WG3 warp 0 issues it; one elected lane arrives `s_ready`.
-> - Layout: Q, K in SMEM → `S` in TMEM (`S_region[q_stage]`).
-> - Dispatch: `tcgen05`.
-> - Handoff: `s_ready` (→ softmax).
+> **块原语读数：分数 MMA**
+> - 作用域：WG3 warp 0 发出它；一个选举 lane 到达 `s_ready`。
+> - 布局：SMEM 中的 Q、K → TMEM 中的 `S`（`S_region[q_stage]`）。
+> - 调度：`tcgen05`。
+> - 交接：`s_ready`（→ softmax）。
 
-The single elected thread arriving on `s_ready` is the entire handoff. It announces that this score tile is finished and that the softmax warpgroup is now free to read it.
+到达 `s_ready` 的单个选举线程就是整个交接。它宣布该分数块已完成，softmax warpgroup 现在可以自由读取它。
 
-### Softmax Between MMAs
+### MMA 之间的 Softmax
 
-Between the two MMAs sits softmax, the stage that turns the score tile `S` into the numerator tile `P`. Its readout card is:
+两个 MMA 之间是 softmax，将分数块 `S` 转换为分子块 `P` 的阶段。它的读数卡片是：
 
-> **Tile-primitive readout: Softmax**
-> - Scope: WG0 (Q stage 0) / WG1 (Q stage 1), full warpgroup.
-> - Layout: `S` in TMEM → registers → `P` in fp16 TMEM (`P_region[wg_id]`).
-> - Dispatch: `tcgen05.ld` to read, TMEM store to write; row-wise math in registers between them.
-> - Handoff: waits `s_ready`; arrives `p_o_rescale` (first 96 columns) and `p_ready_2` (last 32).
+> **块原语读数：Softmax**
+> - 作用域：WG0（Q 阶段 0）/ WG1（Q 阶段 1），完整 warpgroup。
+> - 布局：TMEM 中的 `S` → 寄存器 → fp16 TMEM 中的 `P`（`P_region[wg_id]`）。
+> - 调度：`tcgen05.ld` 读取，TMEM 存储写入；它们之间的寄存器中级数学。
+> - 交接：等待 `s_ready`；到达 `p_o_rescale`（前 96 列）和 `p_ready_2`（最后 32 列）。
 
-This stage is the one with no GEMM counterpart at all. WG0/WG1 wait for the score tile to arrive on `s_ready`, then read it out of TMEM a register-sized chunk at a time:
+这个阶段是完全没有 GEMM 对应物的。WG0/WG1 等待分数块到达 `s_ready`，然后从 TMEM 中逐个寄存器大小的块读取它：
 
 ```python
 Tx.copy_async(
@@ -210,13 +210,13 @@ Tx.copy_async(
 )
 ```
 
-That is a TMEM-to-register tile read under warpgroup scope. Now that the scores are sitting in registers, the softmax warpgroup does three things, in order:
+这是 warpgroup 作用域下的 TMEM 到寄存器块读取。现在分数位于寄存器中，softmax warpgroup 按顺序做三件事：
 
-1. computes the row max and row sum,
-2. computes the softmax numerator tile `P`,
-3. writes `P` back to TMEM as fp16.
+1. 计算行最大值和行和，
+2. 计算 softmax 分子块 `P`，
+3. 将 `P` 以 fp16 写回 TMEM。
 
-The last step looks like:
+最后一步看起来像：
 
 ```python
 Tx.copy_async(
@@ -225,15 +225,15 @@ Tx.copy_async(
 )
 ```
 
-Why write `P` back to TMEM at all, when we just finished computing it in registers? Because the value MMA needs `P` as a *tile operand*, and an MMA cannot read scattered per-thread scalar registers as a matrix. The MMA-readable form of `P` in this kernel is `P_region`, a view over the fp16 TMEM alias `tmem_as_f16`. So the writeback is not redundant motion; it is what puts `P` into the only shape the next MMA can actually consume.
+为什么要将 `P` 写回 TMEM，当我们刚在寄存器中计算完它？因为值 MMA 需要 `P` 作为*块操作数*，MMA 不能将分散的每线程标量寄存器作为矩阵读取。这个内核中 MMA 可读的 `P` 形式是 `P_region`，fp16 TMEM 别名 `tmem_as_f16` 上的视图。所以写回不是冗余移动；它是将 `P` 放入下一个 MMA 实际能消费的唯一形状。
 
-### Value MMA
+### 值 MMA
 
-The second phase, and the one that closes each K/V iteration, is the value MMA. It computes:
+第二个阶段，也是关闭每次 K/V 迭代的阶段，是值 MMA。它计算：
 
 $$O = O + P_{\text{block}}V_{\text{block}}$$
 
-By the time this MMA runs, `O` has already been put into the right state for the current K/V block, initialized on the first block, rescaled on later ones, so all the MMA has to do is accumulate. What sets it apart from GEMM is where the operands live: the A operand is `P` in TMEM, the B operand is `V` in SMEM, and the accumulator `O` is in TMEM as well:
+到这个 MMA 运行时，`O` 已经为当前 K/V 块放入正确的状态，在第一个块上初始化，在后续块上重缩放，所以 MMA 只需累加。它与 GEMM 的区别在于操作数存在于何处：A 操作数是 TMEM 中的 `P`，B 操作数是 SMEM 中的 `V`，累加器 `O` 也在 TMEM 中：
 
 ```python
 # First sub-MMA: columns 0:K_SPLIT (the first 96 of P / rows of V).
@@ -256,42 +256,41 @@ Tx.warp.gemm_async(
 > - Dispatch: `tcgen05` with a TMEM operand.
 > - Handoff: waits `p_o_rescale`, `p_ready_2`, `kv_load.full`; arrives `o_ready` (→ epilogue).
 
-This operand placement is the hardware difference between the two MMAs:
+这种操作数放置是两个 MMA 之间的硬件区别：
 
-- Score MMA reads both operands from SMEM: Q and K.
-- Value MMA reads one operand, `P`, from TMEM.
-- Value MMA reads the other operand, V, from SMEM.
-- The result accumulates into `O` in TMEM.
+- 分数 MMA 从 SMEM 读取两个操作数：Q 和 K。
+- 值 MMA 从 TMEM 读取一个操作数 `P`。
+- 值 MMA 从 SMEM 读取另一个操作数 V。
+- 结果累加到 TMEM 中的 `O`。
 
-The `accum=should_accumulate` flag is what implements the "initialize or add" choice from the algorithm: it is false on the first K/V tile of a query block and true on every tile after that.
+`accum=should_accumulate` 标志实现了算法中的"初始化或累加"选择：它在查询块的第一个 K/V 块上为假，在之后的每个块上为真。
 
-You may also notice that the value MMA is not run as one shot but split into a `96 + 32` schedule:
+你可能还注意到值 MMA 不是一次性运行，而是拆分为 `96 + 32` 调度：
 
-1. Softmax writes `P` in four 32-column chunks.
-2. As soon as the first three chunks are ready, the value MMA starts on the first 96 columns of `P` and the matching rows of `V`.
-3. The final 32 columns wait for `p_ready_2`.
-4. A second MMA consumes that final chunk and finishes the tile.
+1. Softmax 以四个 32 列块写入 `P`。
+2. 一旦前三个块就绪，值 MMA 就开始处理 `P` 的前 96 列和 `V` 的匹配行。
+3. 最后 32 列等待 `p_ready_2`。
+4. 第二个 MMA 消费该最终块并完成块。
 
-The reason for the split is to keep the Tensor Core busy. Run the value MMA as a single instruction and the whole phase would stall until all four 32-column `P` chunks had been exponentiated and stored. By firing on the first three chunks right away, the kernel overlaps the last chunk's `exp` and TMEM write with a 96-wide MMA that is already in flight, turning what would otherwise be idle time into useful work.
+拆分的原因是保持张量核心忙碌。将值 MMA 作为单条指令运行，整个阶段将停顿，直到四个 32 列 `P` 块都被指数化和存储。通过立即对前三个块发起攻击，内核将最后一个块的 `exp` 和 TMEM 写入与已经在飞行中的 96 宽 MMA 重叠，将原本的空闲时间变为有用工作。
 
-## TMEM Layout and Reuse
+## TMEM 布局和重用
 
-All of `S`, `P`, and `O` have to share one `128 x 512` TMEM allocation, and the way they are packed into it is exactly why barriers and layout turn out to be inseparable in this kernel:
+`S`、`P` 和 `O` 都必须共享一个 `128×512` TMEM 分配，它们被打包到其中的方式正是屏障和布局在这个内核中不可分离的原因：
 
-The figure below shows that packing directly: score slots, numerator slots, and output slots all
-share one TMEM allocation, so the barrier protocol is what makes the reuse legal.
+下图直接显示了该打包：分数槽、分子槽和输出槽都共享一个 TMEM 分配，所以屏障协议是使重用合法的因素。
 
-![TMEM Layout](../img/tmem_layout_v3.png)
+![TMEM 布局](../img/tmem_layout_v3.png)
 
-The figure reads as a set of tile slots:
+该图读作一组块槽：
 
-- Score slots hold `S = QK^T`.
-- Numerator slots hold the `P` tile after the softmax exponentiation step.
-- Output slots hold the fp32 `O` accumulator.
+- 分数槽持有 `S = QK^T`。
+- 分子槽持有 softmax 指数化步骤后的 `P` 块。
+- 输出槽持有 fp32 `O` 累加器。
 
-These are not independent buffers. They are regions of the *same* allocation, and the sharing is not a stylistic choice but a forced one. With Q-pipeline depth 2, the two `S` slots (2 × MMA_N = 256 columns) and the two `O` slots (2 × MMA_N = 256 columns) already account for all 512 fp32 columns. There is nothing left over for `P`, so `P` has no choice but to alias the same bytes through a narrower fp16 view. The only reason this is safe is that each region is reused strictly after its previous consumer has finished, and that timing is exactly what the barriers guarantee. So in FA4 the barriers are not merely scheduling; they are what makes the layout legal in the first place.
+这些不是独立缓冲区。它们是*同一*分配的区域，共享不是风格选择而是被迫的。Q 流水线深度为 2 时，两个 `S` 槽（2 × MMA_N = 256 列）和两个 `O` 槽（2 × MMA_N = 256 列）已经占满了所有 512 个 fp32 列。没有剩余给 `P`，所以 `P` 别无选择，只能通过更窄的 fp16 视图别名相同的字节。这安全的唯一原因是每个区域在其先前消费者完成后才被重用，而那个时序正是屏障保证的。所以在 FA4 中，屏障不仅仅是调度；它们是使布局合法的首要因素。
 
-The aliasing trick is set up through a `T.TMEMPool`. The kernel takes one fp32 view (`tmem`) for the score and output accumulators, then rewinds the pool base back to 0 and takes a second, fp16 view (`tmem_as_f16`) over the *same* physical bytes:
+别名技巧通过 `T.TMEMPool` 设置。内核为分数和输出累加器获取一个 fp32 视图（`tmem`），然后将池基倒回 0，并在*相同*物理字节上获取第二个 fp16 视图（`tmem_as_f16`）：
 
 ```python
 tmem_pool = T.TMEMPool(pool, total_cols=N_COLS_TMEM, cta_group=CTA_GROUP, tmem_addr=tmem_addr)
@@ -479,21 +478,21 @@ $$\mathrm{LSE}_i = \log(\mathrm{row\_sum}_i) + \mathrm{row\_max}_i / \sqrt{d}$$
 
 This implementation is forward-output only and does not write LSE.
 
-## Causal Masking
+## 因果掩码
 
-Causal attention adds a constraint (a query may attend only to keys at or before its own position), and the kernel honors it in two complementary ways, one cheap and one precise.
+因果注意力添加了一个约束（查询只能关注其自身位置或之前的位置），内核以两种互补方式满足它，一种便宜，一种精确。
 
-The cheap way is to skip work entirely. Many K/V blocks sit fully above the diagonal and contribute nothing to a given Q block, so `get_n_block_max(...)` computes the last block that block could possibly need, and the loop simply never loads or computes the rest.
+便宜的方式是完全跳过工作。许多 K/V 块完全位于对角线之上，对给定 Q 块没有贡献，所以 `get_n_block_max(...)` 计算该块可能需要的最后一个块，循环根本不加载或计算其余部分。
 
-The precise way handles the blocks that straddle the diagonal, where some columns are valid and some are not. Those blocks still run the score MMA, but softmax masks out the invalid columns before exponentiation. For each row it derives a column limit from the row's query position and the block offset, keeps the columns at or below that limit, and sets every column past it to `-inf` in registers, so those columns contribute nothing to either the row max or the `exp2` numerator.
+精确的方式处理跨越对角线的块，其中一些列有效，一些无效。这些块仍然运行分数 MMA，但 softmax 在指数化之前掩码无效列。对于每行，它从行的查询位置和块偏移推导列限制，保留该限制处及以下的列，并将之后的每列在寄存器中设置为 `-inf`，这样这些列对行最大值或 `exp2` 分子都没有贡献。
 
-Rather than branch element by element, the implementation applies the limit with `mask_r2p(...)`, which turns it into a bit mask over the whole 32-wide score chunk and masks the chunk in one shot. Blocks that lie fully below the diagonal keep every column and need no mask at all.
+实现不是逐元素分支，而是用 `mask_r2p(...)` 应用限制，将其转换为整个 32 宽分数块上的位掩码，一次性掩码该块。完全位于对角线下方的块保留所有列，根本不需要掩码。
 
-Seen from the tile-primitive view, causal mode does not rewrite the data path at all. It only trims the K/V trip count and inserts a masking step into the register-resident softmax, between the score MMA and the `P` writeback.
+从块原语的角度看，因果模式根本不重写数据路径。它只是削减 K/V 迭代次数，并在分数 MMA 和 `P` 写回之间将掩码步骤插入寄存器驻留的 softmax 中。
 
-## GQA Support
+## GQA 支持
 
-Grouped Query Attention lets several query heads share a single K/V head. This saves memory bandwidth, but it raises a packing question: how do we keep just one K/V tile while still feeding many query heads through it? The kernel's answer is to process a whole group of query heads against one scheduled `kv_head_idx` at once:
+分组查询注意力让多个查询头共享单个 K/V 头。这节省了内存带宽，但它提出了一个打包问题：我们如何在仍然为许多查询头提供数据的同时只保留一个 K/V 块？内核的答案是一次处理一整个查询头组，针对一个调度的 `kv_head_idx`：
 
 ```python
 GQA_RATIO = num_qo_heads // num_kv_heads
