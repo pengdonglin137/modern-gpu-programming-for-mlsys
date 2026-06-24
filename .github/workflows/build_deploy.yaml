@@ -3,9 +3,9 @@ name: Build and Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, zh-cn]
   pull_request:
-    branches: [main]
+    branches: [main, zh-cn]
   workflow_dispatch:
 
 # peaceiris pushes the built site to the gh-pages branch with GITHUB_TOKEN.
